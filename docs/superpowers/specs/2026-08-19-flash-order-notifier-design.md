@@ -278,7 +278,9 @@ The lock is released before the network call. That is the entire reason for two 
 
 **The middle case — ack before mark — cannot be eliminated.** Two systems, no shared transaction. Every outbox implementation has this window; the honest ones say so and build the consumer to absorb it. This is precisely why `processed_events` exists and why the guarantee is **at-least-once**, not exactly-once.
 
-**The reclaimer** runs inside every relay instance rather than as a separate process, on `RECLAIM_INTERVAL`. Its query uses `FOR UPDATE SKIP LOCKED` for the same reason the claim does — with N relays scanning concurrently, two of them must never reclaim the same abandoned row. It resets `status` to `pending`, clears `locked_by` and `locked_until`, and sets `next_attempt_at = now()`.
+**The reclaimer** runs inside every relay instance rather than as a separate process, on `RECLAIM_INTERVAL`. It resets `status` to `pending`, clears `locked_by` and `locked_until`, and sets `next_attempt_at = now()`.
+
+Two relays must never reclaim one abandoned row, and it is worth being exact about what delivers that, because it is not `SKIP LOCKED`. The row lock plus the `status='publishing'` predicate is what does: a locked row "will not be returned if [it was] updated after the snapshot and no longer satisf[ies] the query conditions" ([PostgreSQL SELECT](https://www.postgresql.org/docs/18/sql-select.html)), so a peer that waited on the lock re-reads the row as `pending` and passes over it. `FOR UPDATE SKIP LOCKED` is used for the reason the same docs give — to "avoid lock contention with multiple consumers accessing a queue-like table" — so a relay never blocks behind a peer. Measured on Postgres 18: remove it and the second relay still takes a correct disjoint batch, it just waits out the first relay's transaction first.
 
 `locked_by` is the relay instance id: the container hostname plus a per-process UUID, so restarts of the same container are distinguishable. It exists for diagnosis and for invariant I3 — nothing about correctness depends on its value, only on the lease.
 
@@ -385,7 +387,7 @@ Each gets a test module under `tests/invariants/`, written before its implementa
 | --- | --- | --- |
 | I1 | **No loss** — every committed order eventually reaches the topic | Raise at each hook in turn; assert the event still arrives |
 | I2 | **No orphan events** — no event whose order is not committed | Roll back the API transaction; assert the topic stays empty |
-| I3 | **No double-claim** — two relays never hold one row at once | Run two relays against a large batch; assert disjoint claims |
+| I3 | **No double-claim** — two relays never hold one row at once | Two relays claiming at once, then two reclaiming at once; assert disjoint rows both times |
 | I4 | **Duplicates tolerated** — forced duplicate yields one email | Raise at `after_publish_before_mark`; assert exactly one send |
 | I5 | **Per-order ordering** — same `order_id` arrives in produce order | Emit a sequence for one order; assert partition and offset order |
 | I6 | **Backlog and drain** — broker down, API still returns 201 | Stop the broker; post orders; restart; assert full drain |
@@ -457,6 +459,7 @@ outboxexpress/
     ├── kafka_container.py      # apache/kafka container, ported from upstream -- see 9.5
     ├── pending_events.py       # outbox rows for the relay's tests
     ├── topic_reader.py         # read a topic back from the start
+    ├── outbox_state.py         # read and nudge outbox row state -- see 9.5
     ├── unit/
     └── invariants/
 ```
