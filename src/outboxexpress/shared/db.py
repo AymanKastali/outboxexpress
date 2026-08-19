@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import Session, sessionmaker
 
 from .config import get_settings
 
@@ -25,3 +26,9 @@ def create_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]
     # expire_on_commit=False: the write path reads attributes off an instance *after*
     # commit to build its response. With expiry on, that would trigger lazy IO.
     return async_sessionmaker(engine, expire_on_commit=False)
+
+
+def create_sync_sessionmaker(engine: Engine) -> sessionmaker[Session]:
+    # No expire_on_commit=False here, unlike the async factory: the relay reads Rows
+    # from RETURNING rather than ORM instances, so expiry has nothing to reload.
+    return sessionmaker(engine)
