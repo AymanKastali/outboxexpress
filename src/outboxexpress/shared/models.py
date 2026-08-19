@@ -3,6 +3,7 @@
 import enum
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -54,11 +55,12 @@ class OutboxStatus(enum.StrEnum):
     DEAD = enum.auto()
 
 
-_outbox_status = Enum(
-    OutboxStatus,
-    name="outbox_status",
-    values_callable=lambda e: [member.value for member in e],
-)
+def _status_values(enum_class: type[OutboxStatus]) -> list[str]:
+    """Store the lowercase *values*; SQLAlchemy would otherwise store member names."""
+    return [member.value for member in enum_class]
+
+
+_outbox_status = Enum(OutboxStatus, name="outbox_status", values_callable=_status_values)
 
 
 class Order(Base):
@@ -86,7 +88,7 @@ class Outbox(Base):
     aggregate_type: Mapped[str] = mapped_column(Text, nullable=False)
     aggregate_id: Mapped[str] = mapped_column(Text, nullable=False)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )
@@ -127,7 +129,7 @@ class IdempotencyKey(Base):
     request_hash: Mapped[str] = mapped_column(Text, nullable=False)
     order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orders.id"), nullable=False)
     response_code: Mapped[int] = mapped_column(Integer, nullable=False)
-    response_body: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    response_body: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )

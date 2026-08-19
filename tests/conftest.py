@@ -2,7 +2,7 @@ import asyncio
 import os
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Protocol
 
 import pytest
 from alembic import command
@@ -20,6 +20,14 @@ from outboxexpress.shared.db import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TABLES = "orders, outbox, idempotency_keys, processed_events"
+
+SessionFactory = async_sessionmaker[AsyncSession]
+
+
+class RunAsync(Protocol):
+    """Runs a session-using coroutine and hands back whatever it returned."""
+
+    def __call__[T](self, scenario: Callable[[SessionFactory], Awaitable[T]]) -> T: ...
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -48,15 +56,15 @@ def clean_tables(sync_engine: Engine) -> Iterator[None]:
 
 
 @pytest.fixture
-def run_async() -> Callable[[Callable[[async_sessionmaker[AsyncSession]], Awaitable[Any]]], Any]:
+def run_async() -> RunAsync:
     """Run a coroutine that needs sessions, building the engine inside the loop.
 
     An async engine binds its pool to the loop that created it, so a shared engine
     would fail the moment a second ``asyncio.run`` opened a new one.
     """
 
-    def _run(scenario: Callable[[async_sessionmaker[AsyncSession]], Awaitable[Any]]) -> Any:
-        async def main() -> Any:
+    def _run[T](scenario: Callable[[SessionFactory], Awaitable[T]]) -> T:
+        async def main() -> T:
             engine = create_async_engine_from_settings()
             try:
                 return await scenario(create_sessionmaker(engine))

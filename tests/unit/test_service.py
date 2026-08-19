@@ -1,9 +1,10 @@
 import pytest
 from sqlalchemy import Engine, text
 
+from conftest import RunAsync, SessionFactory
 from outboxexpress.api.idempotency import IdempotencyConflict
 from outboxexpress.api.schemas import NewOrder
-from outboxexpress.api.service import place_order
+from outboxexpress.api.service import StoredResponse, place_order
 
 REQUEST = NewOrder(customer_email="a@b.com", item_sku="SKU-1", quantity=2)
 
@@ -16,22 +17,23 @@ def counts(engine: Engine) -> dict[str, int]:
         }
 
 
-def test_one_call_writes_exactly_one_order_and_one_event(run_async, sync_engine):
-    async def scenario(factory):
-        async with factory() as session:
-            return await place_order(session, idempotency_key="k-1", request=REQUEST)
+async def _place_one(factory: SessionFactory) -> StoredResponse:
+    async with factory() as session:
+        return await place_order(session, idempotency_key="k-1", request=REQUEST)
 
-    stored = run_async(scenario)
+
+def test_one_call_writes_exactly_one_order_and_one_event(
+    run_async: RunAsync, sync_engine: Engine
+) -> None:
+    stored = run_async(_place_one)
     assert stored.status_code == 201
     assert counts(sync_engine) == {"orders": 1, "outbox": 1, "idempotency_keys": 1}
 
 
-def test_the_outbox_row_carries_the_event_and_the_order_as_its_key(run_async, sync_engine):
-    async def scenario(factory):
-        async with factory() as session:
-            return await place_order(session, idempotency_key="k-1", request=REQUEST)
-
-    stored = run_async(scenario)
+def test_the_outbox_row_carries_the_event_and_the_order_as_its_key(
+    run_async: RunAsync, sync_engine: Engine
+) -> None:
+    stored = run_async(_place_one)
     with sync_engine.connect() as connection:
         row = connection.execute(
             text("SELECT id, aggregate_type, aggregate_id, event_type, payload, status FROM outbox")
@@ -45,13 +47,11 @@ def test_the_outbox_row_carries_the_event_and_the_order_as_its_key(run_async, sy
     assert row.payload["order"]["id"] == stored.body["order_id"]
 
 
-def test_replaying_a_key_returns_the_stored_response_byte_for_byte(run_async, sync_engine):
-    async def scenario(factory):
-        async with factory() as session:
-            first = await place_order(session, idempotency_key="k-1", request=REQUEST)
-        async with factory() as session:
-            second = await place_order(session, idempotency_key="k-1", request=REQUEST)
-        return first, second
+def test_replaying_a_key_returns_the_stored_response_byte_for_byte(
+    run_async: RunAsync, sync_engine: Engine
+) -> None:
+    async def scenario(factory: SessionFactory) -> tuple[StoredResponse, StoredResponse]:
+        return await _place_one(factory), await _place_one(factory)
 
     first, second = run_async(scenario)
     assert first.body == second.body
@@ -59,10 +59,9 @@ def test_replaying_a_key_returns_the_stored_response_byte_for_byte(run_async, sy
     assert counts(sync_engine) == {"orders": 1, "outbox": 1, "idempotency_keys": 1}
 
 
-def test_reusing_a_key_with_a_different_body_is_a_conflict(run_async):
-    async def scenario(factory):
-        async with factory() as session:
-            await place_order(session, idempotency_key="k-1", request=REQUEST)
+def test_reusing_a_key_with_a_different_body_is_a_conflict(run_async: RunAsync) -> None:
+    async def scenario(factory: SessionFactory) -> None:
+        await _place_one(factory)
         async with factory() as session:
             await place_order(
                 session,

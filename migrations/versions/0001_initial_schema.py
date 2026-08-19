@@ -15,7 +15,7 @@ depends_on = None
 
 # create_type=False: the type is created and dropped explicitly below, so that
 # downgrade actually leaves a clean database instead of an orphaned enum.
-outbox_status = postgresql.ENUM(
+outbox_status: postgresql.ENUM[str] = postgresql.ENUM(
     "pending", "publishing", "published", "dead", name="outbox_status", create_type=False
 )
 
@@ -47,7 +47,7 @@ def upgrade() -> None:
         sa.Column(
             "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
         ),
-        sa.Column("status", outbox_status, nullable=False),
+        sa.Column[str]("status", outbox_status, nullable=False),
         sa.Column("attempts", sa.Integer(), server_default=sa.text("0"), nullable=False),
         sa.Column(
             "next_attempt_at",

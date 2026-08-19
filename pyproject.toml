@@ -20,6 +20,7 @@ dev = [
     "testcontainers==4.15.0",
     "httpx==0.28.1",
     "ruff==0.16.3",
+    "pyright==1.1.411",
 ]
 
 [project.scripts]
@@ -40,6 +41,13 @@ extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.14"
+venvPath = "."
+venv = ".venv"
+include = ["src", "tests", "migrations"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

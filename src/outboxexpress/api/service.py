@@ -1,6 +1,7 @@
 """The write path. One transaction, three rows, no network call."""
 
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +29,7 @@ CREATED = 201
 @dataclass(frozen=True)
 class StoredResponse:
     status_code: int
-    body: dict
+    body: dict[str, Any]
 
 
 async def place_order(
@@ -42,7 +43,7 @@ async def place_order(
             seen = await load_key(session, idempotency_key)
             if seen is not None:
                 return _replay(seen, request)
-            record = await _write(session, idempotency_key, request)
+            record = await stage_order(session, idempotency_key, request)
     except IntegrityError:
         # Another request committed this key first. Its INSERT blocked ours on the
         # primary key until it committed, so the winner is durably visible by now.
@@ -58,7 +59,10 @@ async def place_order(
     return StoredResponse(record.response_code, record.response_body)
 
 
-async def _write(session: AsyncSession, idempotency_key: str, request: NewOrder) -> IdempotencyKey:
+async def stage_order(
+    session: AsyncSession, idempotency_key: str, request: NewOrder
+) -> IdempotencyKey:
+    """Stage the three rows on the session. The caller owns the transaction."""
     now = utcnow()
     order = Order(
         id=new_id(),

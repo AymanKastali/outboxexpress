@@ -3,10 +3,15 @@
 import pytest
 from sqlalchemy import Engine, text
 
+from conftest import RunAsync, SessionFactory
 from outboxexpress.api.schemas import NewOrder
-from outboxexpress.api.service import _write, place_order
+from outboxexpress.api.service import place_order, stage_order
 
 REQUEST = NewOrder(customer_email="a@b.com", item_sku="SKU-1", quantity=2)
+
+
+class Boom(Exception):
+    """Stands in for a process dying mid-transaction."""
 
 
 def table_counts(engine: Engine) -> tuple[int, int]:
@@ -17,15 +22,14 @@ def table_counts(engine: Engine) -> tuple[int, int]:
         )
 
 
-def test_a_failed_transaction_leaves_neither_an_order_nor_an_event(run_async, sync_engine):
-    class Boom(Exception):
-        pass
-
-    async def scenario(factory):
+def test_a_failed_transaction_leaves_neither_an_order_nor_an_event(
+    run_async: RunAsync, sync_engine: Engine
+) -> None:
+    async def scenario(factory: SessionFactory) -> None:
         async with factory() as session:
             with pytest.raises(Boom):
                 async with session.begin():
-                    await _write(session, "k-1", REQUEST)
+                    await stage_order(session, "k-1", REQUEST)
                     # Force all three INSERTs to the server, so the rollback below is
                     # undoing real rows rather than discarding a pending unit of work.
                     await session.flush()
@@ -35,8 +39,10 @@ def test_a_failed_transaction_leaves_neither_an_order_nor_an_event(run_async, sy
     assert table_counts(sync_engine) == (0, 0)
 
 
-def test_every_committed_order_has_exactly_one_matching_event(run_async, sync_engine):
-    async def scenario(factory):
+def test_every_committed_order_has_exactly_one_matching_event(
+    run_async: RunAsync, sync_engine: Engine
+) -> None:
+    async def scenario(factory: SessionFactory) -> None:
         for index in range(5):
             async with factory() as session:
                 await place_order(session, idempotency_key=f"k-{index}", request=REQUEST)
