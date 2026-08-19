@@ -118,3 +118,54 @@ def mark_published(session: Session, event_ids: Sequence[UUID], *, instance_id: 
         marked = len(session.execute(mark).scalars().all())
     log.info("outbox_published", locked_by=instance_id, count=marked)
     return marked
+
+
+def reclaim_expired(session: Session, *, instance_id: str, batch_size: int) -> int:
+    """Return abandoned rows to ``pending``. Returns how many were recovered.
+
+    A row sits in ``publishing`` with an expired lease only because the relay holding
+    it died, or its publish outlived the lease. Either way the event was never retired,
+    so it goes back on the queue rather than waiting for a human to notice.
+
+    ``SKIP LOCKED`` for the same reason the claim uses it: so a relay never blocks
+    behind a peer that is mid-reclaim. It is *not* what stops two relays recovering one
+    row -- the row lock and the ``status='publishing'`` predicate do that, because a
+    peer that waited on the lock re-reads the row as ``pending`` and passes over it.
+    Measured on Postgres 18: drop ``SKIP LOCKED`` and the second relay still recovers a
+    correct disjoint batch, it just waits out the first relay's transaction to do it.
+    """
+    abandoned = (
+        select(Outbox.id)
+        .where(Outbox.status == OutboxStatus.PUBLISHING, Outbox.locked_until < func.now())
+        # locked_until leads because ix_outbox_reclaim is ordered by it, so the longest
+        # abandoned row is recovered first and the scan stays off the published rows.
+        .order_by(Outbox.locked_until)
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+        .scalar_subquery()
+    )
+    reclaim = (
+        update(Outbox)
+        .where(Outbox.id.in_(abandoned))
+        .values(
+            status=OutboxStatus.PENDING,
+            locked_by=None,
+            locked_until=None,
+            # Due at once, not backed off: an expired lease says the relay stopped, not
+            # that the broker refused. Backoff belongs to a rejected delivery (plan 3).
+            # One batch shares one now(), so the claim's tie-break falls to id -- and
+            # being UUIDv7 that is write order, which is what keeps I5 intact here.
+            next_attempt_at=func.now(),
+            # attempts is deliberately untouched: the next claim increments it, and
+            # incrementing here as well would count a single delivery attempt twice.
+        )
+        .returning(Outbox.id)
+        .execution_options(synchronize_session=False)
+    )
+    with session.begin():
+        reclaimed = len(session.execute(reclaim).scalars().all())
+    if reclaimed:
+        # Warning, not info: a healthy relay never reclaims anything. Every one of
+        # these is a process that died mid-cycle or a publish that outran its lease.
+        log.warning("outbox_reclaimed", reclaimed_by=instance_id, count=reclaimed)
+    return reclaimed

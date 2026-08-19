@@ -4,9 +4,10 @@ from collections.abc import Sequence
 
 import pytest
 from confluent_kafka import KafkaError, Producer
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from outbox_state import statuses
 from outboxexpress.relay import hooks, loop
 from outboxexpress.relay.outbox import ClaimedEvent
 from outboxexpress.relay.publisher import PublishOutcome, create_producer
@@ -19,65 +20,56 @@ class Boom(Exception):
     """Stands in for the relay process dying at a named seam."""
 
 
-@pytest.fixture
-def settings(broker: str, topic: str) -> Settings:
-    return Settings(kafka_bootstrap_servers=broker, kafka_topic=topic)
-
-
-def statuses(engine: Engine) -> list[str]:
-    with engine.connect() as connection:
-        return list(
-            connection.scalars(text("SELECT status FROM outbox ORDER BY next_attempt_at, id"))
-        )
-
-
 def test_a_cycle_publishes_every_claimed_row_and_retires_it(
-    relay_sessions: sessionmaker[Session], sync_engine: Engine, settings: Settings, broker: str
+    relay_sessions: sessionmaker[Session],
+    sync_engine: Engine,
+    relay_settings: Settings,
+    broker: str,
 ) -> None:
     write_pending_events(relay_sessions, count=3)
-    producer = create_producer(settings)
+    producer = create_producer(relay_settings)
 
     with relay_sessions() as session:
-        marked = loop.run_once(session, producer, instance_id="relay-1", settings=settings)
+        marked = loop.run_once(session, producer, instance_id="relay-1", settings=relay_settings)
 
     assert marked == 3
     assert statuses(sync_engine) == ["published"] * 3
-    assert len(read_events(broker, settings.kafka_topic, expected=3)) == 3
+    assert len(read_events(broker, relay_settings.kafka_topic, expected=3)) == 3
 
 
 def test_an_empty_outbox_retires_nothing(
-    relay_sessions: sessionmaker[Session], settings: Settings
+    relay_sessions: sessionmaker[Session], relay_settings: Settings
 ) -> None:
-    producer = create_producer(settings)
+    producer = create_producer(relay_settings)
 
     with relay_sessions() as session:
-        assert loop.run_once(session, producer, instance_id="relay-1", settings=settings) == 0
+        assert loop.run_once(session, producer, instance_id="relay-1", settings=relay_settings) == 0
 
 
 def test_a_crash_between_claim_and_publish_leaves_the_row_claimed(
     relay_sessions: sessionmaker[Session],
     sync_engine: Engine,
-    settings: Settings,
+    relay_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     broker: str,
 ) -> None:
     write_pending_events(relay_sessions, count=1)
     monkeypatch.setattr(hooks, "after_claim", _raise)
-    producer = create_producer(settings)
+    producer = create_producer(relay_settings)
 
     with relay_sessions() as session, pytest.raises(Boom):
-        loop.run_once(session, producer, instance_id="relay-1", settings=settings)
+        loop.run_once(session, producer, instance_id="relay-1", settings=relay_settings)
 
     # Nothing published, and the row still holds its lease. Recovering it is the
     # reclaimer's job in plan 2 -- until then this is where the row stops.
     assert statuses(sync_engine) == ["publishing"]
-    assert read_events(broker, settings.kafka_topic, expected=1, timeout=QUIET_TIMEOUT) == []
+    assert read_events(broker, relay_settings.kafka_topic, expected=1, timeout=QUIET_TIMEOUT) == []
 
 
 def test_a_crash_after_the_ack_leaves_kafka_ahead_of_postgres(
     relay_sessions: sessionmaker[Session],
     sync_engine: Engine,
-    settings: Settings,
+    relay_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     broker: str,
 ) -> None:
@@ -87,27 +79,27 @@ def test_a_crash_after_the_ack_leaves_kafka_ahead_of_postgres(
     # guarantee is at-least-once.
     write_pending_events(relay_sessions, count=1)
     monkeypatch.setattr(hooks, "after_publish_before_mark", _raise)
-    producer = create_producer(settings)
+    producer = create_producer(relay_settings)
 
     with relay_sessions() as session, pytest.raises(Boom):
-        loop.run_once(session, producer, instance_id="relay-1", settings=settings)
+        loop.run_once(session, producer, instance_id="relay-1", settings=relay_settings)
 
     assert statuses(sync_engine) == ["publishing"]
-    assert len(read_events(broker, settings.kafka_topic, expected=1)) == 1
+    assert len(read_events(broker, relay_settings.kafka_topic, expected=1)) == 1
 
 
 def test_the_mark_hook_runs_after_the_row_is_retired(
     relay_sessions: sessionmaker[Session],
     sync_engine: Engine,
-    settings: Settings,
+    relay_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     write_pending_events(relay_sessions, count=1)
     monkeypatch.setattr(hooks, "after_mark", _raise)
-    producer = create_producer(settings)
+    producer = create_producer(relay_settings)
 
     with relay_sessions() as session, pytest.raises(Boom):
-        loop.run_once(session, producer, instance_id="relay-1", settings=settings)
+        loop.run_once(session, producer, instance_id="relay-1", settings=relay_settings)
 
     assert statuses(sync_engine) == ["published"]
 

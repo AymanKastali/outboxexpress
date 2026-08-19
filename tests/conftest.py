@@ -23,7 +23,7 @@ from testcontainers.community.postgres import PostgresContainer
 from kafka_container import ApacheKafkaContainer
 from outboxexpress.api.dependencies import get_session
 from outboxexpress.api.main import create_app
-from outboxexpress.shared.config import get_settings
+from outboxexpress.shared.config import Settings, get_settings
 from outboxexpress.shared.db import (
     create_async_engine_from_settings,
     create_sessionmaker,
@@ -114,6 +114,12 @@ def topic(broker: str) -> str:
 def relay_sessions(sync_engine: Engine) -> sessionmaker[Session]:
     """Sessions shaped the way the relay opens them: synchronous, one per cycle."""
     return create_sync_sessionmaker(sync_engine)
+
+
+@pytest.fixture
+def relay_settings(broker: str, topic: str) -> Settings:
+    """Settings as the relay would read them, pointed at this test's broker and topic."""
+    return Settings(kafka_bootstrap_servers=broker, kafka_topic=topic)
 
 
 @pytest.fixture
