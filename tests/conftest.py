@@ -1,18 +1,25 @@
 import asyncio
 import os
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator
+from concurrent.futures import Future
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
+from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
+
+# NewTopic is the documented import path, but the admin package never re-exports it,
+# so pyright strict reads it as private. The library's packaging is what is imprecise.
+from confluent_kafka.admin import AdminClient, NewTopic  # pyright: ignore[reportPrivateImportUsage]
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from testcontainers.community.postgres import PostgresContainer
 
+from kafka_container import ApacheKafkaContainer
 from outboxexpress.api.dependencies import get_session
 from outboxexpress.api.main import create_app
 from outboxexpress.shared.config import get_settings
@@ -28,6 +35,13 @@ TABLES = "orders, outbox, idempotency_keys, processed_events"
 # One canonical valid request. Every HTTP test varies from this rather than
 # restating it, so a schema change lands in exactly one place.
 VALID_ORDER = {"customer_email": "a@b.com", "item_sku": "SKU-1", "quantity": 2}
+
+TOPIC = "orders.events"
+PARTITIONS = 3
+
+# What create_topics really returns. The library annotates it as a bare ``Future``,
+# which pyright strict reads as partially unknown, so the type is restated here once.
+TopicFutures = dict[str, Future[None]]
 
 SessionFactory = async_sessionmaker[AsyncSession]
 
@@ -61,6 +75,37 @@ def clean_tables(sync_engine: Engine) -> Iterator[None]:
     yield
     with sync_engine.begin() as connection:
         connection.execute(text(f"TRUNCATE {TABLES} CASCADE"))
+
+
+@pytest.fixture(scope="session")
+def broker() -> Iterator[str]:
+    # Unlike `database`, this sets no environment variable: nothing reads the broker
+    # address from settings in the suite -- every test builds the Settings it wants.
+    with ApacheKafkaContainer() as container:
+        yield container.bootstrap_server()
+
+
+@pytest.fixture
+def topic(broker: str) -> str:
+    """A uniquely named topic per test, so every consumer starts at offset zero.
+
+    Reusing one name and deleting between tests races Kafka's asynchronous deletion --
+    the recreate fails with "marked for deletion". A new name cannot race anything.
+    Partition count matches spec 8.1; replication is 1 because there is one broker.
+    """
+    name = f"{TOPIC}-{uuid4().hex[:8]}"
+    admin = AdminClient({"bootstrap.servers": broker})
+    created = cast(
+        TopicFutures,
+        admin.create_topics(  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+            [NewTopic(name, num_partitions=PARTITIONS, replication_factor=1)]
+        ),
+    )
+    # Creation is asynchronous, and result() is what reports a rejected config: without
+    # waiting here, the topic may not exist when the test produces to it.
+    for future in created.values():
+        future.result()
+    return name
 
 
 @pytest.fixture
