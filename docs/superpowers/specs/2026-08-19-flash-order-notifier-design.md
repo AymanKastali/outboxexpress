@@ -119,6 +119,8 @@ Verified against PyPI on 2026-08-19. Every C-extension dependency has a cp314 wh
 
 Images: `python:3.14-slim`, `postgres:18`, `apache/kafka:4.3.1`, `axllent/mailpit`, `kafbat/kafka-ui`.
 
+Tests run `apache/kafka-native:4.3.1` rather than the JVM image: the same Apache distribution and version as a native binary, which Confluent recommends for tests on startup time and memory. testcontainers-python ships no container for either Apache image — its only Kafka container is hard-wired to Confluent's image layout, a shape upstream Testcontainers has itself deprecated — so the suite ports upstream's current recipe in `tests/kafka_container.py`.
+
 No `pytest-asyncio`. FastAPI's documented test approach is the **synchronous** `TestClient`, and test fixtures can use a sync SQLAlchemy engine even though the app uses the async one. Adding an async test framework for tests that need not be async is a dependency bought for nothing. If a genuinely async test appears later, add it then.
 
 ---
@@ -349,6 +351,10 @@ Three partitions match the broker count and allow 2–3 notifier instances, maki
 
 `acks=all`, `enable.idempotence=true`, `compression.type=lz4`, `linger.ms=5`, `delivery.timeout.ms=30000`.
 
+Verified accepted verbatim by librdkafka 2.15.0: `delivery.timeout.ms` and `compression.type` are the Java-compatible aliases, not typos for `message.timeout.ms` and `compression.codec`.
+
+`acks=all` is not merely compatible with `enable.idempotence` — it is **required** to be consistent with it. librdkafka adjusts the properties idempotence depends on (`acks`, `max.in.flight`, `retries`) and *fails producer construction* if the config contradicts one, so the explicit `acks=all` is load-bearing rather than decorative. The same mechanism is what makes per-order ordering hold under retry: "with Idempotent Producer enabled there is no risk of reordering despite `max.in.flight` > 1 (capped at 5)" ([librdkafka INTRODUCTION.md](https://github.com/confluentinc/librdkafka/blob/master/INTRODUCTION.md)). The partition key places one order's events together; idempotence keeps them in order once there.
+
 ### 8.3 Consumer (`notifier`)
 
 `group.id=order-email`, `enable.auto.commit=false`, `auto.offset.reset=earliest`. Offsets are committed only after the database transaction commits.
@@ -387,7 +393,7 @@ Each gets a test module under `tests/invariants/`, written before its implementa
 
 ### 9.3 Known limitation
 
-The test suite runs a **single** Kafka broker via testcontainers — fast, and sufficient for six of the seven invariants. I6 stops the broker container outright rather than shrinking the ISR. The genuine `min.insync.replicas` version exists only as a manual drill against the three-broker compose stack (section 9.4). This gap is stated rather than papered over.
+The test suite runs a **single** Kafka broker via testcontainers — the native build of the same 4.3.1 (see 3.6) — fast, and sufficient for six of the seven invariants. I6 stops the broker container outright rather than shrinking the ISR. The genuine `min.insync.replicas` version exists only as a manual drill against the three-broker compose stack (section 9.4). This gap is stated rather than papered over.
 
 ### 9.4 Chaos drills
 
@@ -401,6 +407,15 @@ The test suite runs a **single** Kafka broker via testcontainers — fast, and s
 | `chaos-pause-notifier` | Consumer-group lag climbing live in kafka-ui |
 | `chaos-duplicate` | A forced republish; Mailpit still shows one email |
 | `load` | Fire N concurrent orders |
+
+### 9.5 Where shared test code lives
+
+Two homes, chosen by how a test reaches the thing rather than by what it does:
+
+- **Fixtures go in `conftest.py`** and arrive by injection. pytest's own rule is to *never* import from a `conftest.py` except for type annotations — an imported session-scoped fixture can end up running twice — so the only names test modules take from it are `Protocol`s and aliases like `RunAsync` and `SessionFactory`, used purely to annotate.
+- **Plain helper functions go in a sibling module under `tests/`** and are imported normally. `tests/` is not a package and pytest prepends its directory to `sys.path`, so `from pending_events import write_pending_events` resolves.
+
+The split keeps the two mechanisms from blurring, and keeps `conftest.py` to the fixtures a reader is looking for when they open it.
 
 ---
 
@@ -428,7 +443,7 @@ outboxexpress/
 │   │   └── idempotency.py
 │   ├── relay/
 │   │   ├── __main__.py         # entrypoint, signal handling
-│   │   ├── claim.py            # SKIP LOCKED claim + lease reclaim
+│   │   ├── outbox.py           # every relay transition: claim, mark, reclaim, dead-letter
 │   │   ├── publisher.py        # producer + error classification
 │   │   ├── hooks.py            # failure-injection seams
 │   │   └── loop.py
@@ -438,7 +453,10 @@ outboxexpress/
 │       ├── dedup.py
 │       └── mailer.py
 └── tests/
-    ├── conftest.py             # testcontainers: postgres + kafka
+    ├── conftest.py             # fixtures only: testcontainers postgres + kafka, sessions
+    ├── kafka_container.py      # apache/kafka container, ported from upstream -- see 9.5
+    ├── pending_events.py       # outbox rows for the relay's tests
+    ├── topic_reader.py         # read a topic back from the start
     ├── unit/
     └── invariants/
 ```
