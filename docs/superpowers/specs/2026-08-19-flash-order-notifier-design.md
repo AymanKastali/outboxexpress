@@ -44,10 +44,11 @@ Deferred to a possible second spec: a Debezium CDC variant of the relay, for sid
 
 | Area | Decision | Rationale |
 | --- | --- | --- |
-| Language | Python 3.12 | Chosen by the user. |
+| Language | Python 3.14 | Current stable (3.14.7, supported to 2030-10). |
 | Web framework | FastAPI + SQLAlchemy 2.0 | `with session.begin():` makes the transaction boundary explicit while remaining realistic production code. |
-| Database | PostgreSQL 16 | `SELECT … FOR UPDATE SKIP LOCKED` is the standard primitive for a safe multi-worker relay. |
-| Broker | Apache Kafka 4.x, KRaft mode, **3 brokers** | See 3.1. |
+| Database | PostgreSQL 18 | `SELECT … FOR UPDATE SKIP LOCKED` is the standard primitive for a safe multi-worker relay. |
+| DB driver | `psycopg[binary]` 3 | See 3.5. |
+| Broker | Apache Kafka 4.3, KRaft mode, **3 brokers** | See 3.1. |
 | Kafka image | `apache/kafka` | See 3.2. |
 | Kafka client | `confluent-kafka` (librdkafka) | See 3.3. |
 | Relay style | Hand-written polling publisher, lease-based claim | See 3.4. |
@@ -85,6 +86,40 @@ Three candidate relay designs were considered.
 **Rejected for this project — lock held through publish.** A single transaction that selects with `FOR UPDATE SKIP LOCKED`, publishes, marks, and commits is simpler and correct. Its flaw is holding a row lock and a pooled connection across a network call: a wedged broker holds both for the full publish timeout. It also skips the three mechanics that make production outboxes interesting.
 
 **Chosen — claim-then-publish (lease).** Two short transactions with the network call between them. Costs roughly sixty extra lines and a reclaimer for expired leases, and delivers lease expiry, attempt counting, and a natural home for DLQ routing. This matches the established guidance that lock-holding transactions should never span external I/O.
+
+### 3.5 `psycopg` 3, not `asyncpg`
+
+`psycopg3` ships a sync and an async implementation behind one driver. `api` is async and `relay`/`notifier` are sync worker processes, so a single dependency and a single connection-string format cover all three. `asyncpg` is async-only and would force a second driver — and a second set of type-adaptation quirks — into the sync services for no gain.
+
+Install as `psycopg[binary]` so the C extension arrives prebuilt rather than compiling libpq bindings in every container image.
+
+`greenlet` is a transitive requirement of SQLAlchemy's asyncio support. It is listed explicitly below only because its wheel availability was verified, not because it is imported directly.
+
+### 3.6 Pinned versions
+
+Verified against PyPI on 2026-08-19. Every C-extension dependency has a cp314 wheel, so no container build compiles from source.
+
+| Package | Version | Notes |
+| --- | --- | --- |
+| `fastapi` | 0.141.1 | pure Python |
+| `uvicorn` | 0.52.3 | the ASGI server FastAPI documents |
+| `sqlalchemy` | 2.0.52 | pure Python |
+| `psycopg[binary]` | 3.3.4 | cp314 wheels present |
+| `greenlet` | 3.5.5 | cp314 wheels present; transitive via SQLAlchemy async |
+| `alembic` | 1.19.1 | |
+| `confluent-kafka` | 2.15.0 | cp314 wheels present |
+| `pydantic` | 2.13.4 | |
+| `pydantic-settings` | 2.15.0 | |
+| `structlog` | 26.1.0 | |
+| `pytest` | 9.1.1 | |
+| `testcontainers` | 4.15.0 | |
+| `httpx` | 0.28.1 | required by FastAPI's `TestClient` |
+| `ruff` | 0.16.3 | Rust binary, `py3-none-manylinux` |
+| `uv` | 0.12.5 | Rust binary, `py3-none-manylinux` |
+
+Images: `python:3.14-slim`, `postgres:18`, `apache/kafka:4.3.1`, `axllent/mailpit`, `kafbat/kafka-ui`.
+
+No `pytest-asyncio`. FastAPI's documented test approach is the **synchronous** `TestClient`, and test fixtures can use a sync SQLAlchemy engine even though the app uses the async one. Adding an async test framework for tests that need not be async is a dependency bought for nothing. If a genuinely async test appears later, add it then.
 
 ---
 
