@@ -35,6 +35,8 @@ packages = ["src/outboxexpress"]
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+# ruff formats Python blocks inside Markdown; keep it away from the design docs.
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
