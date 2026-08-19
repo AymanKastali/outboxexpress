@@ -10,7 +10,7 @@ MAX_INT32 = 2_147_483_647
 
 
 class NewOrder(BaseModel):
-    # forbid: an unrecognised field must be a client bug, not a silently dropped one.
+    # forbid: an unrecognized field must be a client bug, not a silently dropped one.
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     customer_email: EmailStr

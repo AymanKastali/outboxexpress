@@ -21,7 +21,7 @@ def test_outbox_indexes_are_partial() -> None:
     assert "locked_until" in reclaim and "status = 'publishing'" in reclaim
 
 
-def test_outbox_status_serialises_as_lowercase_values() -> None:
+def test_outbox_status_serializes_as_lowercase_values() -> None:
     assert OutboxStatus.PENDING == "pending"
     assert [s.value for s in OutboxStatus] == ["pending", "publishing", "published", "dead"]
 
