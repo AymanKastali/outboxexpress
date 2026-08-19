@@ -17,6 +17,7 @@ from confluent_kafka.admin import AdminClient, NewTopic  # pyright: ignore[repor
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from testcontainers.community.postgres import PostgresContainer
 
 from kafka_container import ApacheKafkaContainer
@@ -27,6 +28,7 @@ from outboxexpress.shared.db import (
     create_async_engine_from_settings,
     create_sessionmaker,
     create_sync_engine_from_settings,
+    create_sync_sessionmaker,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +108,12 @@ def topic(broker: str) -> str:
     for future in created.values():
         future.result()
     return name
+
+
+@pytest.fixture
+def relay_sessions(sync_engine: Engine) -> sessionmaker[Session]:
+    """Sessions shaped the way the relay opens them: synchronous, one per cycle."""
+    return create_sync_sessionmaker(sync_engine)
 
 
 @pytest.fixture
