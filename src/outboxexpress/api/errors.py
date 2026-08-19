@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 from outboxexpress.shared.logging import get_logger
 
 from .idempotency import IdempotencyConflict
+from .queries import OrderNotFound
 
 log = get_logger(__name__)
 
@@ -20,6 +21,7 @@ log = get_logger(__name__)
 def register_error_handlers(app: FastAPI) -> None:
     """Map each failure the spec names to its status code, once, in one place."""
     app.add_exception_handler(RequestValidationError, handle_validation_error)
+    app.add_exception_handler(OrderNotFound, handle_order_not_found)
     app.add_exception_handler(IdempotencyConflict, handle_idempotency_conflict)
     app.add_exception_handler(OperationalError, handle_database_unavailable)
 
@@ -34,6 +36,12 @@ async def handle_validation_error(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST, content={"detail": jsonable_encoder(exc.errors())}
     )
+
+
+async def handle_order_not_found(_: Request, exc: Exception) -> JSONResponse:
+    """404. Naming the id makes the response useful in a log without a request trace."""
+    assert isinstance(exc, OrderNotFound)
+    return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": str(exc)})
 
 
 async def handle_idempotency_conflict(_: Request, exc: Exception) -> JSONResponse:
