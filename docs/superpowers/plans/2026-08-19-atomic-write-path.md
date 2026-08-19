@@ -44,7 +44,7 @@ This work is split across small plans. **Only plan 2 is written.**
 
 **Interfaces:**
 - Consumes: `NewOrder`, `request_fingerprint`, `load_key`, `IdempotencyConflict` (from `api/`); `Order`, `Outbox`, `IdempotencyKey`, `new_id`, `utcnow`, `ORDER_STATUS_CREATED`, `AGGREGATE_TYPE_ORDER` (from `shared/models.py`); `OrderCreatedV1`, `OrderSnapshot` (from `shared/events.py`)
-- Produces: `StoredResponse(status_code: int, body: dict)`; `async place_order(session, *, idempotency_key: str, request: NewOrder) -> StoredResponse`; `_write(session, idempotency_key, request) -> IdempotencyKey`
+- Produces: `StoredResponse(status_code: int, body: dict)`; `async place_order(session, *, idempotency_key: str, request: NewOrder) -> StoredResponse`; `async _write(session, idempotency_key, request) -> IdempotencyKey`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -139,13 +139,13 @@ async def place_order(
 ) -> StoredResponse:
     """Create an order and its event atomically."""
     async with session.begin():
-        record = _write(session, idempotency_key, request)
+        record = await _write(session, idempotency_key, request)
     # Readable after commit only because the sessionmaker sets expire_on_commit=False.
     log.info("order_committed", order_id=str(record.order_id))
     return StoredResponse(record.response_code, record.response_body)
 
 
-def _write(session: AsyncSession, idempotency_key: str, request: NewOrder) -> IdempotencyKey:
+async def _write(session: AsyncSession, idempotency_key: str, request: NewOrder) -> IdempotencyKey:
     now = utcnow()
     order = Order(
         id=new_id(),
@@ -186,8 +186,12 @@ def _write(session: AsyncSession, idempotency_key: str, request: NewOrder) -> Id
         },
     )
     log.info("order_written", order_id=str(order.id), event_id=str(event.event_id))
-    # add_all, not three flushes: the unit of work orders the inserts by foreign key.
-    session.add_all([order, outbox, record])
+    # The order must land before the row whose foreign key references it. SQLAlchemy
+    # sorts a flush by *relationship* dependency, and there is no relationship here --
+    # only a raw ForeignKey column -- so the ordering is stated explicitly.
+    session.add(order)
+    await session.flush()
+    session.add_all([outbox, record])
     return record
 ```
 
@@ -278,7 +282,7 @@ async def place_order(
         return _replay(seen, request)
 
     async with session.begin():
-        record = _write(session, idempotency_key, request)
+        record = await _write(session, idempotency_key, request)
     log.info("order_committed", order_id=str(record.order_id))
     return StoredResponse(record.response_code, record.response_body)
 ```
@@ -346,8 +350,7 @@ def test_a_failed_transaction_leaves_neither_an_order_nor_an_event(run_async, sy
         async with factory() as session:
             with pytest.raises(Boom):
                 async with session.begin():
-                    _write(session, "k-1", REQUEST)
-                    await session.flush()
+                    await _write(session, "k-1", REQUEST)
                     raise Boom  # a crash after the inserts, before COMMIT
 
     run_async(scenario)
@@ -463,7 +466,7 @@ and wrap the write in `place_order`:
 ```python
     try:
         async with session.begin():
-            record = _write(session, idempotency_key, request)
+            record = await _write(session, idempotency_key, request)
     except IntegrityError:
         # Another request committed this key first. It blocked us on the primary key
         # until it committed, so by the time we get here the winner is durably visible.
