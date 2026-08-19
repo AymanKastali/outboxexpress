@@ -415,10 +415,12 @@ class Base(DeclarativeBase):
 
 
 class OutboxStatus(enum.StrEnum):
-    PENDING = "pending"
-    PUBLISHING = "publishing"
-    PUBLISHED = "published"
-    DEAD = "dead"
+    # StrEnum's auto() is the lowercased member name — the values the partial
+    # index predicates in the migration match on.
+    PENDING = enum.auto()
+    PUBLISHING = enum.auto()
+    PUBLISHED = enum.auto()
+    DEAD = enum.auto()
 
 
 _outbox_status = Enum(
