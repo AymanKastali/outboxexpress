@@ -470,13 +470,17 @@ and wrap the write in `place_order`:
 ```python
     try:
         async with session.begin():
+            seen = await load_key(session, idempotency_key)
+            if seen is not None:
+                return _replay(seen, request)
             record = await _write(session, idempotency_key, request)
     except IntegrityError:
-        # Another request committed this key first. It blocked us on the primary key
-        # until it committed, so by the time we get here the winner is durably visible.
-        winner = await load_key(session, idempotency_key)
+        # Another request committed this key first. Its INSERT blocked ours on the
+        # primary key until it committed, so the winner is durably visible by now.
+        async with session.begin():
+            winner = await load_key(session, idempotency_key)
         if winner is None:
-            raise  # a different constraint failed — do not swallow it
+            raise  # some other constraint failed -- do not swallow it
         log.info("idempotent_race_lost", idempotency_key=idempotency_key)
         return _replay(winner, request)
 ```

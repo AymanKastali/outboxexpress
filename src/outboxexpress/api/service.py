@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from outboxexpress.shared.events import OrderCreatedV1, OrderSnapshot
@@ -36,11 +37,22 @@ async def place_order(
     """Create an order and its event atomically, or replay a previous identical request."""
     # The lookup sits inside the transaction: a read before session.begin() would open
     # an implicit one, and begin() would then raise "a transaction is already begun".
-    async with session.begin():
-        seen = await load_key(session, idempotency_key)
-        if seen is not None:
-            return _replay(seen, request)
-        record = await _write(session, idempotency_key, request)
+    try:
+        async with session.begin():
+            seen = await load_key(session, idempotency_key)
+            if seen is not None:
+                return _replay(seen, request)
+            record = await _write(session, idempotency_key, request)
+    except IntegrityError:
+        # Another request committed this key first. Its INSERT blocked ours on the
+        # primary key until it committed, so the winner is durably visible by now.
+        async with session.begin():
+            winner = await load_key(session, idempotency_key)
+        if winner is None:
+            raise  # some other constraint failed -- do not swallow it
+        log.info("idempotent_race_lost", idempotency_key=idempotency_key)
+        return _replay(winner, request)
+
     # Readable after commit only because the sessionmaker sets expire_on_commit=False.
     log.info("order_committed", order_id=str(record.order_id))
     return StoredResponse(record.response_code, record.response_body)
