@@ -15,6 +15,8 @@ class Settings(BaseSettings):
 
     # No Kafka settings here. The api is the only M1 service and it has no broker.
     database_url: str = "postgresql+psycopg://outbox:outbox@localhost:5432/outbox"
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
     log_level: str = "INFO"
     log_json: bool = True
 

@@ -19,7 +19,7 @@ class IdempotencyConflict(Exception):
 
 
 def request_fingerprint(request: NewOrder) -> str:
-    # Hash the *validated* model, canonically serialised, so the comparison means
+    # Hash the *validated* model, canonically serialized, so the comparison means
     # "same request" rather than "same bytes": key order and whitespace stop mattering.
     canonical = json.dumps(request.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
