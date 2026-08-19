@@ -1,0 +1,64 @@
+name: outboxexpress
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: outbox
+      POSTGRES_PASSWORD: outbox
+      POSTGRES_DB: outbox
+    # Deliberately unpublished. Every client of this database -- migrate, api, and
+    # later the relay and notifier -- is on this network already, so a host port
+    # would add reachability nobody needs and collide with any other Postgres on
+    # the machine. For a psql prompt: docker compose exec postgres psql -U outbox -d outbox
+    volumes:
+      # Postgres 18 moved PGDATA to /var/lib/postgresql/18/docker and declares its
+      # volume one level up. The /var/lib/postgresql/data mount inherited from every
+      # Postgres 16 example persists nothing here, and does so silently.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # -h forces TCP. During initdb the entrypoint runs a temporary server with
+      # listen_addresses='' that a socket-based pg_isready reports as ready -- so the
+      # bare form goes healthy mid-initialization and migrate races the real startup.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U outbox -d outbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      OUTBOX_DATABASE_URL: postgresql+psycopg://outbox:outbox@postgres:5432/outbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      OUTBOX_DATABASE_URL: postgresql+psycopg://outbox:outbox@postgres:5432/outbox
+      # The 127.0.0.1 default binds the container's own loopback, which the published
+      # port cannot reach. In a container the interface is the boundary, not the guard.
+      OUTBOX_API_HOST: 0.0.0.0
+    ports:
+      # Loopback, not 0.0.0.0: a published port is a DNAT rule that sits in front of
+      # the host firewall, so the short form would offer this to the whole network.
+      # The host side is a variable because 8000 is a popular port to already own.
+      - "127.0.0.1:${OUTBOX_HOST_PORT:-8000}:8000"
+    depends_on:
+      # Not "postgres is up" -- "the schema is present". Ordering the migration ahead
+      # of the first request is the whole reason this service exists.
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  postgres-data:
