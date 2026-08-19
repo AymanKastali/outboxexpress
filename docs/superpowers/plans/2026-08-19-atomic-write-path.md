@@ -277,11 +277,12 @@ async def place_order(
     session: AsyncSession, *, idempotency_key: str, request: NewOrder
 ) -> StoredResponse:
     """Create an order and its event atomically, or replay a previous identical request."""
-    seen = await load_key(session, idempotency_key)
-    if seen is not None:
-        return _replay(seen, request)
-
+    # The lookup sits inside the transaction: a read before session.begin() would open
+    # an implicit one, and begin() would then raise "a transaction is already begun".
     async with session.begin():
+        seen = await load_key(session, idempotency_key)
+        if seen is not None:
+            return _replay(seen, request)
         record = await _write(session, idempotency_key, request)
     log.info("order_committed", order_id=str(record.order_id))
     return StoredResponse(record.response_code, record.response_body)

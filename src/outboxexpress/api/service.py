@@ -16,7 +16,7 @@ from outboxexpress.shared.models import (
     utcnow,
 )
 
-from .idempotency import request_fingerprint
+from .idempotency import IdempotencyConflict, load_key, request_fingerprint
 from .schemas import NewOrder
 
 log = get_logger(__name__)
@@ -33,8 +33,13 @@ class StoredResponse:
 async def place_order(
     session: AsyncSession, *, idempotency_key: str, request: NewOrder
 ) -> StoredResponse:
-    """Create an order and its event atomically."""
+    """Create an order and its event atomically, or replay a previous identical request."""
+    # The lookup sits inside the transaction: a read before session.begin() would open
+    # an implicit one, and begin() would then raise "a transaction is already begun".
     async with session.begin():
+        seen = await load_key(session, idempotency_key)
+        if seen is not None:
+            return _replay(seen, request)
         record = await _write(session, idempotency_key, request)
     # Readable after commit only because the sessionmaker sets expire_on_commit=False.
     log.info("order_committed", order_id=str(record.order_id))
@@ -89,3 +94,9 @@ async def _write(session: AsyncSession, idempotency_key: str, request: NewOrder)
     await session.flush()
     session.add_all([outbox, record])
     return record
+
+
+def _replay(record: IdempotencyKey, request: NewOrder) -> StoredResponse:
+    if record.request_hash != request_fingerprint(request):
+        raise IdempotencyConflict(record.key)
+    return StoredResponse(record.response_code, record.response_body)
