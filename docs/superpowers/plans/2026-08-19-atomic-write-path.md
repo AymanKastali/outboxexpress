@@ -352,6 +352,9 @@ def test_a_failed_transaction_leaves_neither_an_order_nor_an_event(run_async, sy
             with pytest.raises(Boom):
                 async with session.begin():
                     await _write(session, "k-1", REQUEST)
+                    # Force all three INSERTs to the server, so the rollback below is
+                    # undoing real rows rather than discarding a pending unit of work.
+                    await session.flush()
                     raise Boom  # a crash after the inserts, before COMMIT
 
     run_async(scenario)
