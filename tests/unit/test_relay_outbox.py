@@ -6,7 +6,8 @@ from uuid import UUID
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from outboxexpress.relay.outbox import claim_batch, mark_published
+from outbox_state import expire_leases, statuses
+from outboxexpress.relay.outbox import claim_batch, mark_published, reclaim_expired
 from outboxexpress.shared.models import utcnow
 from pending_events import write_pending_events
 
@@ -82,11 +83,11 @@ def test_a_row_not_yet_due_is_left_alone(
         assert claim_batch(session, instance_id="relay-1", batch_size=10, lease_seconds=LEASE) == []
 
 
-def test_two_relays_claiming_at_once_get_disjoint_rows(
+def test_a_claimed_row_is_not_offered_to_the_next_claim(
     relay_sessions: sessionmaker[Session],
 ) -> None:
-    # The SKIP LOCKED contract. I3 proves it across two processes in plan 2; here it is
-    # the unit behaviour of the statement itself.
+    # Sequential on purpose: claim_batch commits before returning, so this pins the
+    # status guard, not SKIP LOCKED. Two relays genuinely overlapping is I3's job.
     write_pending_events(relay_sessions, count=6)
 
     with relay_sessions() as first, relay_sessions() as second:
@@ -130,3 +131,70 @@ def test_a_relay_cannot_mark_a_row_another_relay_holds(
 def test_marking_nothing_touches_nothing(relay_sessions: sessionmaker[Session]) -> None:
     with relay_sessions() as session:
         assert mark_published(session, [], instance_id="relay-1") == 0
+
+
+def test_an_expired_lease_returns_the_row_to_pending(
+    relay_sessions: sessionmaker[Session], sync_engine: Engine
+) -> None:
+    (event_id,) = write_pending_events(relay_sessions, count=1)
+    with relay_sessions() as session:
+        claim_batch(session, instance_id="relay-1", batch_size=10, lease_seconds=LEASE)
+    expire_leases(sync_engine)
+
+    with relay_sessions() as session:
+        assert reclaim_expired(session, instance_id="relay-2", batch_size=10) == 1
+
+    state = row_state(sync_engine, event_id)
+    assert state["status"] == "pending"
+    assert state["locked_by"] is None
+    assert state["locked_until"] is None
+    # The attempt was already counted when the row was claimed. Counting it again here
+    # would make `attempts` say two deliveries were tried when only one was.
+    assert state["attempts"] == 1
+
+
+def test_a_live_lease_is_left_alone(
+    relay_sessions: sessionmaker[Session], sync_engine: Engine
+) -> None:
+    # The lease's whole purpose: a relay still inside its window keeps its row, so a
+    # slow publish is never republished underneath the process performing it.
+    (event_id,) = write_pending_events(relay_sessions, count=1)
+    with relay_sessions() as session:
+        claim_batch(session, instance_id="relay-1", batch_size=10, lease_seconds=LEASE)
+
+    with relay_sessions() as session:
+        assert reclaim_expired(session, instance_id="relay-2", batch_size=10) == 0
+
+    assert row_state(sync_engine, event_id)["status"] == "publishing"
+
+
+def test_a_reclaim_stops_at_the_batch_size(
+    relay_sessions: sessionmaker[Session], sync_engine: Engine
+) -> None:
+    write_pending_events(relay_sessions, count=5)
+    with relay_sessions() as session:
+        claim_batch(session, instance_id="relay-1", batch_size=5, lease_seconds=LEASE)
+    expire_leases(sync_engine)
+
+    with relay_sessions() as session:
+        assert reclaim_expired(session, instance_id="relay-2", batch_size=3) == 3
+
+    assert statuses(sync_engine).count("pending") == 3
+
+
+def test_a_reclaimed_row_is_claimable_by_another_relay(
+    relay_sessions: sessionmaker[Session], sync_engine: Engine
+) -> None:
+    # Recovery is only worth anything if the row can then be published. This is the
+    # join between the reclaim and the claim, and it is what I1 rests on.
+    (event_id,) = write_pending_events(relay_sessions, count=1)
+    with relay_sessions() as session:
+        claim_batch(session, instance_id="relay-1", batch_size=10, lease_seconds=LEASE)
+    expire_leases(sync_engine)
+
+    with relay_sessions() as session:
+        reclaim_expired(session, instance_id="relay-2", batch_size=10)
+        claimed = claim_batch(session, instance_id="relay-2", batch_size=10, lease_seconds=LEASE)
+
+    assert [event.event_id for event in claimed] == [event_id]
+    assert row_state(sync_engine, event_id)["locked_by"] == "relay-2"

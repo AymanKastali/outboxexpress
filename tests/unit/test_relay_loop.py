@@ -4,9 +4,10 @@ from collections.abc import Sequence
 
 import pytest
 from confluent_kafka import KafkaError, Producer
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from outbox_state import statuses
 from outboxexpress.relay import hooks, loop
 from outboxexpress.relay.outbox import ClaimedEvent
 from outboxexpress.relay.publisher import PublishOutcome, create_producer
@@ -22,13 +23,6 @@ class Boom(Exception):
 @pytest.fixture
 def settings(broker: str, topic: str) -> Settings:
     return Settings(kafka_bootstrap_servers=broker, kafka_topic=topic)
-
-
-def statuses(engine: Engine) -> list[str]:
-    with engine.connect() as connection:
-        return list(
-            connection.scalars(text("SELECT status FROM outbox ORDER BY next_attempt_at, id"))
-        )
 
 
 def test_a_cycle_publishes_every_claimed_row_and_retires_it(
