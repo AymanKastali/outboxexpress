@@ -16,8 +16,8 @@ from outboxexpress.shared.config import Settings
 from outboxexpress.shared.logging import get_logger
 
 from . import hooks
-from .outbox import claim_batch, mark_published
-from .publisher import flush_timeout_seconds, publish_batch
+from .outbox import FailedEvent, claim_batch, mark_dead, mark_published, reschedule_failed
+from .publisher import flush_timeout_seconds, is_retriable, publish_batch
 
 log = get_logger(__name__)
 
@@ -57,15 +57,38 @@ def run_once(
     )
     hooks.after_publish_before_mark()
 
-    delivered = [outcome.event_id for outcome in outcomes if outcome.error is None]
+    delivered: list[uuid.UUID] = []
+    retriable: list[FailedEvent] = []
+    poisoned: list[FailedEvent] = []
+    for outcome in outcomes:
+        if outcome.error is None:
+            delivered.append(outcome.event_id)
+        elif is_retriable(outcome.error):
+            retriable.append(FailedEvent(event_id=outcome.event_id, error=str(outcome.error)))
+        else:
+            poisoned.append(FailedEvent(event_id=outcome.event_id, error=str(outcome.error)))
+
     marked = mark_published(session, delivered, instance_id=instance_id)
     hooks.after_mark()
+    rescheduled = reschedule_failed(
+        session,
+        retriable,
+        instance_id=instance_id,
+        base_seconds=settings.relay_backoff_base_seconds,
+        cap_seconds=settings.relay_backoff_cap_seconds,
+    )
+    parked = mark_dead(session, poisoned, instance_id=instance_id)
 
     log.info(
         "relay_cycle",
         locked_by=instance_id,
         claimed=len(claimed),
         published=marked,
-        failed=len(claimed) - marked,
+        rescheduled=rescheduled,
+        dead=parked,
+        # Claimed but never reported on, so nothing here can classify it. These rows
+        # keep their lease and the reclaimer is what moves them -- the only job it has
+        # left now that a verdict is resolved in the cycle that produced it.
+        unreported=len(claimed) - len(outcomes),
     )
     return marked

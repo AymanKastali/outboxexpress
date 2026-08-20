@@ -4,7 +4,7 @@ from collections.abc import Sequence
 
 import pytest
 from confluent_kafka import KafkaError, Producer
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from outbox_state import statuses
@@ -139,10 +139,82 @@ def test_a_cycle_retires_only_the_events_the_broker_confirmed(
             session, create_producer(settings), instance_id="relay-1", settings=settings
         )
 
-    # The rejected row keeps its lease and its claim, and only the reclaimer in plan 2
-    # brings it back. What must never happen is it being retired alongside its sibling.
+    # The rejected row is resolved in this same cycle rather than left for the
+    # reclaimer: MSG_SIZE_TOO_LARGE is poison, so it is parked. What must never
+    # happen is it being retired alongside its sibling.
     assert marked == 1
-    assert statuses(sync_engine) == ["published", "publishing"]
+    assert statuses(sync_engine) == ["published", "dead"]
+
+
+def test_a_retriable_rejection_returns_the_row_to_pending_with_its_error(
+    relay_sessions: sessionmaker[Session],
+    sync_engine: Engine,
+    relay_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A broker outage, in the shape the relay actually sees it: a verdict carrying
+    # _MSG_TIMED_OUT. The row must come back to pending -- never dead, however many
+    # times this happens (spec 7.2).
+    write_pending_events(relay_sessions, count=1)
+
+    def timed_out(
+        _producer: Producer,
+        events: Sequence[ClaimedEvent],
+        *,
+        topic: str,
+        timeout_seconds: float,
+    ) -> list[PublishOutcome]:
+        return [
+            PublishOutcome(event_id=events[0].event_id, error=KafkaError(KafkaError._MSG_TIMED_OUT))
+        ]
+
+    monkeypatch.setattr(loop, "publish_batch", timed_out)
+
+    with relay_sessions() as session:
+        marked = loop.run_once(
+            session,
+            create_producer(relay_settings),
+            instance_id="relay-1",
+            settings=relay_settings,
+        )
+
+    assert marked == 0
+    assert statuses(sync_engine) == ["pending"]
+    with sync_engine.connect() as connection:
+        assert connection.scalar(text("SELECT last_error FROM outbox")) is not None
+
+
+def test_an_event_with_no_verdict_keeps_its_lease_for_the_reclaimer(
+    relay_sessions: sessionmaker[Session],
+    sync_engine: Engine,
+    relay_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The reclaimer's remaining job after this plan, pinned. No verdict means neither
+    # delivered nor rejected, so there is nothing to classify and nothing to resolve;
+    # the lease expiring is the only thing that can move this row.
+    write_pending_events(relay_sessions, count=1)
+
+    def no_report(
+        _producer: Producer,
+        events: Sequence[ClaimedEvent],
+        *,
+        topic: str,
+        timeout_seconds: float,
+    ) -> list[PublishOutcome]:
+        return []
+
+    monkeypatch.setattr(loop, "publish_batch", no_report)
+
+    with relay_sessions() as session:
+        loop.run_once(
+            session,
+            create_producer(relay_settings),
+            instance_id="relay-1",
+            settings=relay_settings,
+        )
+
+    assert statuses(sync_engine) == ["publishing"]
 
 
 def test_instance_ids_distinguish_two_processes_on_one_host() -> None:
