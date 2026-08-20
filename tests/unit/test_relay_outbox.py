@@ -11,6 +11,7 @@ from outbox_state import expire_leases, statuses
 from outboxexpress.relay.outbox import (
     FailedEvent,
     claim_batch,
+    mark_dead,
     mark_published,
     reclaim_expired,
     reschedule_failed,
@@ -325,3 +326,69 @@ def test_rescheduling_nothing_touches_nothing(relay_sessions: sessionmaker[Sessi
             )
             == 0
         )
+
+
+def test_a_poison_message_is_parked_with_its_error(
+    relay_sessions: sessionmaker[Session], sync_engine: Engine
+) -> None:
+    (event_id,) = write_pending_events(relay_sessions, count=1)
+    with relay_sessions() as session:
+        claim_batch(session, instance_id="relay-1", batch_size=10, lease_seconds=LEASE)
+
+    with relay_sessions() as session:
+        parked = mark_dead(
+            session,
+            [FailedEvent(event_id=event_id, error="Broker: Message size too large")],
+            instance_id="relay-1",
+        )
+
+    assert parked == 1
+    state = row_state(sync_engine, event_id)
+    assert state["status"] == "dead"
+    assert state["last_error"] == "Broker: Message size too large"
+    assert state["locked_by"] is None
+    assert state["locked_until"] is None
+    # Not published, so published_at stays empty: the event never reached the topic.
+    assert state["published_at"] is None
+
+
+def test_a_dead_row_is_invisible_to_the_claim_and_the_reclaim(
+    relay_sessions: sessionmaker[Session], sync_engine: Engine
+) -> None:
+    # This is what ends the loop. Before this plan a rejected row went publishing ->
+    # reclaimed -> pending -> claimed -> rejected, forever. `dead` is outside both
+    # scans' predicates, so neither of them can pick it up again.
+    (event_id,) = write_pending_events(relay_sessions, count=1)
+    with relay_sessions() as session:
+        claim_batch(session, instance_id="relay-1", batch_size=10, lease_seconds=LEASE)
+        mark_dead(session, [FailedEvent(event_id=event_id, error="poison")], instance_id="relay-1")
+    expire_leases(sync_engine)
+
+    with relay_sessions() as session:
+        assert reclaim_expired(session, instance_id="relay-2", batch_size=10) == 0
+        assert claim_batch(session, instance_id="relay-2", batch_size=10, lease_seconds=LEASE) == []
+
+    assert row_state(sync_engine, event_id)["status"] == "dead"
+
+
+def test_a_relay_cannot_kill_a_row_another_relay_holds(
+    relay_sessions: sessionmaker[Session], sync_engine: Engine
+) -> None:
+    (event_id,) = write_pending_events(relay_sessions, count=1)
+    with relay_sessions() as session:
+        claim_batch(session, instance_id="relay-1", batch_size=10, lease_seconds=LEASE)
+
+    with relay_sessions() as session:
+        assert (
+            mark_dead(
+                session, [FailedEvent(event_id=event_id, error="poison")], instance_id="relay-2"
+            )
+            == 0
+        )
+
+    assert row_state(sync_engine, event_id)["status"] == "publishing"
+
+
+def test_marking_nothing_dead_touches_nothing(relay_sessions: sessionmaker[Session]) -> None:
+    with relay_sessions() as session:
+        assert mark_dead(session, [], instance_id="relay-1") == 0

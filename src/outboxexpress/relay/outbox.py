@@ -287,3 +287,48 @@ def reschedule_failed(
         # is an event the broker refused and this relay has agreed to try again.
         log.warning("outbox_rescheduled", locked_by=instance_id, count=rescheduled)
     return rescheduled
+
+
+def mark_dead(session: Session, failures: Sequence[FailedEvent], *, instance_id: str) -> int:
+    """Park rows that will never publish. Returns how many were parked.
+
+    Spec 7.2: a non-retriable failure is resolved at once rather than retried, because
+    a poison message teaches nothing on the thousandth attempt. Nothing is lost --
+    ``dead`` is a parking state, not a delete. The row keeps its payload and gains
+    ``last_error``, so it stays queryable and replayable where it sits.
+
+    What makes the state worth having is that it is outside both other scans:
+    ``claim_batch`` takes only ``pending`` and ``reclaim_expired`` only ``publishing``.
+    A dead row is therefore never picked up again, which is the loop this ends.
+
+    Per row for the same reason as ``reschedule_failed``: ``last_error`` differs, and
+    the executemany form that would batch them cannot return the count the
+    ``locked_by`` guard needs.
+    """
+    if not failures:
+        return 0
+    with session.begin():
+        parked = 0
+        for failure in failures:
+            kill = (
+                update(Outbox)
+                .where(
+                    Outbox.id == failure.event_id,
+                    Outbox.status == OutboxStatus.PUBLISHING,
+                    Outbox.locked_by == instance_id,
+                )
+                .values(
+                    status=OutboxStatus.DEAD,
+                    last_error=failure.error,
+                    locked_by=None,
+                    locked_until=None,
+                )
+                .returning(Outbox.id)
+                .execution_options(synchronize_session=False)
+            )
+            parked += len(session.execute(kill).scalars().all())
+    if parked:
+        # error, not warning: a reschedule resolves itself in time, this one needs a
+        # person. The event will not reach the topic until someone acts on it.
+        log.error("outbox_dead", locked_by=instance_id, count=parked)
+    return parked
