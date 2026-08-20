@@ -6,6 +6,7 @@ plans. Each function owns its transaction and holds it for a single statement --
 lock in this file is ever held across the network call in ``publisher``.
 """
 
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
@@ -29,6 +30,18 @@ class ClaimedEvent:
     aggregate_id: str
     event_type: str
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class FailedEvent:
+    """One rejected event, and what the broker said about it.
+
+    ``error`` is already rendered to text: the classification happened in
+    ``publisher``, and this module has no business re-reading a ``KafkaError``.
+    """
+
+    event_id: UUID
+    error: str
 
 
 def claim_batch(
@@ -169,3 +182,108 @@ def reclaim_expired(session: Session, *, instance_id: str, batch_size: int) -> i
         # these is a process that died mid-cycle or a publish that outran its lease.
         log.warning("outbox_reclaimed", reclaimed_by=instance_id, count=reclaimed)
     return reclaimed
+
+
+# 2**32 seconds is 136 years, so clamping here cannot shorten a delay the cap would
+# have allowed. It exists because attempts is unbounded -- a retriable failure retries
+# forever -- and 1.0 * 2**2000 raises OverflowError rather than returning inf.
+_BACKOFF_EXPONENT_LIMIT = 32
+
+
+def retry_ceiling_seconds(attempts: int, *, base_seconds: float, cap_seconds: float) -> float:
+    """The longest a row may wait before its next attempt (spec 7.1: 1 s, x2, cap 60 s).
+
+    Deterministic, and separate from the jitter that draws against it, so the policy
+    can be asserted exactly instead of sampled. A claimed row always has ``attempts``
+    of at least 1; the floor below is there so the function is total.
+    """
+    exponent = min(max(attempts - 1, 0), _BACKOFF_EXPONENT_LIMIT)
+    return min(cap_seconds, base_seconds * 2**exponent)
+
+
+def retry_delay(attempts: int, *, base_seconds: float, cap_seconds: float) -> timedelta:
+    """How long this row actually waits: full jitter over the ceiling.
+
+    ``uniform(0, ceiling)`` rather than equal or decorrelated jitter, because AWS's
+    measurements put full jitter ahead of both on total work and on completion time
+    (https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/).
+
+    The documented objection is that the delay can collapse toward zero, so this
+    guarantees no minimum wait. That costs nothing here, and not by luck: librdkafka
+    reports ``_MSG_TIMED_OUT`` only once ``delivery.timeout.ms`` has fully elapsed, so
+    a retriable failure has *by definition* already spent its whole delivery window.
+    The delivery budget paces a relay through an outage whatever the jitter draws.
+    """
+    ceiling = retry_ceiling_seconds(attempts, base_seconds=base_seconds, cap_seconds=cap_seconds)
+    # random, not secrets: this is load spreading, not a security decision.
+    return timedelta(seconds=random.uniform(0, ceiling))
+
+
+def reschedule_failed(
+    session: Session,
+    failures: Sequence[FailedEvent],
+    *,
+    instance_id: str,
+    base_seconds: float,
+    cap_seconds: float,
+) -> int:
+    """Put retriably-failed rows back on the queue, due after a backoff.
+
+    Returns how many actually moved. Spec 7.2: a retriable failure is never
+    dead-lettered, however often it has failed. The backlog is the feature.
+
+    One statement per row, unlike every other transition in this file, because each
+    row carries its own delay and its own error text. SQLAlchemy's bulk-UPDATE-by-
+    primary-key form would collapse them into one executemany, and it is the wrong
+    trade here: it cannot carry RETURNING ("does not support RETURNING because the SQL
+    UPDATE statement is executed via DBAPI executemany"), and RETURNING is what counts
+    the rows that actually moved. That count is not decoration -- it is how the
+    ``locked_by`` guard below reports that another relay took the row. The cost is
+    bounded: at most ``BATCH_SIZE`` rows, only on a cycle where a publish was already
+    rejected, and one transaction still covers the lot.
+
+    The ``locked_by`` guard is spelled out here rather than shared with
+    ``mark_published``, matching how that function spells out its own. It is also what
+    makes reading ``attempts`` before writing safe: if the lease has since passed to
+    another relay the update matches nothing, which is the correct outcome.
+    """
+    if not failures:
+        return 0
+    event_ids = [failure.event_id for failure in failures]
+    with session.begin():
+        attempts_by_id = {
+            row.id: row.attempts
+            for row in session.execute(
+                select(Outbox.id, Outbox.attempts).where(Outbox.id.in_(event_ids))
+            ).all()
+        }
+        rescheduled = 0
+        for failure in failures:
+            delay = retry_delay(
+                attempts_by_id[failure.event_id],
+                base_seconds=base_seconds,
+                cap_seconds=cap_seconds,
+            )
+            reschedule = (
+                update(Outbox)
+                .where(
+                    Outbox.id == failure.event_id,
+                    Outbox.status == OutboxStatus.PUBLISHING,
+                    Outbox.locked_by == instance_id,
+                )
+                .values(
+                    status=OutboxStatus.PENDING,
+                    next_attempt_at=func.now() + delay,
+                    last_error=failure.error,
+                    locked_by=None,
+                    locked_until=None,
+                )
+                .returning(Outbox.id)
+                .execution_options(synchronize_session=False)
+            )
+            rescheduled += len(session.execute(reschedule).scalars().all())
+    if rescheduled:
+        # Warning rather than info: a healthy relay reschedules nothing. Each of these
+        # is an event the broker refused and this relay has agreed to try again.
+        log.warning("outbox_rescheduled", locked_by=instance_id, count=rescheduled)
+    return rescheduled

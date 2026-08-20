@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     relay_lease_seconds: int = 60
     relay_poll_interval_seconds: float = 0.5
 
+    # Spec 7.1. Full jitter draws uniformly below a ceiling that doubles per attempt
+    # and stops at the cap; tests shrink both so a backoff does not cost real seconds.
+    relay_backoff_base_seconds: float = 1.0
+    relay_backoff_cap_seconds: float = 60.0
+
     @model_validator(mode="after")
     def _delivery_must_time_out_inside_the_lease(self) -> Self:
         """Spec 7.1's hard constraint. Tests shrink both, so it is checked, not pinned."""

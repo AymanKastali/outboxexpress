@@ -22,6 +22,8 @@ def test_relay_settings_carry_the_values_the_spec_fixes() -> None:
     assert settings.relay_batch_size == 100
     assert settings.relay_lease_seconds == 60
     assert settings.kafka_delivery_timeout_ms == 30_000
+    assert settings.relay_backoff_base_seconds == 1.0
+    assert settings.relay_backoff_cap_seconds == 60.0
 
 
 def test_a_delivery_timeout_at_or_above_the_lease_is_refused() -> None:
