@@ -88,7 +88,6 @@ def test_a_message_that_is_itself_the_problem_is_poison() -> None:
     # No payload gets smaller, or less corrupt, by being retried.
     assert not is_retriable(KafkaError(KafkaError.MSG_SIZE_TOO_LARGE))
     assert not is_retriable(KafkaError(KafkaError.RECORD_LIST_TOO_LARGE))
-    assert not is_retriable(KafkaError(KafkaError.INVALID_MSG_SIZE))
     assert not is_retriable(KafkaError(KafkaError.INVALID_RECORD))
     # CORRUPT_MESSAGE. Kafka's protocol table marks this retriable, describing a
     # broker re-reading a request; a record produced corrupt stays corrupt.
@@ -146,7 +145,6 @@ NON_RETRIABLE_CODES = frozenset(
     {
         KafkaError.MSG_SIZE_TOO_LARGE,
         KafkaError.RECORD_LIST_TOO_LARGE,
-        KafkaError.INVALID_MSG_SIZE,
         KafkaError.INVALID_RECORD,
         # CORRUPT_MESSAGE under its librdkafka name. Kafka's protocol table calls this
         # one retriable, which is the broker's view of a re-read; a record we produced
@@ -518,13 +516,19 @@ def reschedule_failed(
     dead-lettered, however often it has failed. The backlog is the feature.
 
     One statement per row, unlike every other transition in this file, because each
-    row carries its own delay and its own error text. That is bounded -- at most
-    ``BATCH_SIZE`` rows, and only on a cycle where a publish was already rejected --
-    and one transaction still covers the lot, so the batch moves or none of it does.
+    row carries its own delay and its own error text. SQLAlchemy's bulk-UPDATE-by-
+    primary-key form would collapse them into one executemany, and it is the wrong
+    trade here: it cannot carry RETURNING ("does not support RETURNING because the SQL
+    UPDATE statement is executed via DBAPI executemany"), and RETURNING is what counts
+    the rows that actually moved. That count is not decoration -- it is how the
+    ``locked_by`` guard below reports that another relay took the row. The cost is
+    bounded: at most ``BATCH_SIZE`` rows, only on a cycle where a publish was already
+    rejected, and one transaction still covers the lot.
 
-    The ``locked_by`` guard is the one ``mark_published`` relies on, and it is what
-    makes reading ``attempts`` before writing safe here: if the lease has since passed
-    to another relay the update matches nothing, which is the correct outcome.
+    The ``locked_by`` guard is spelled out here rather than shared with
+    ``mark_published``, matching how that function spells out its own. It is also what
+    makes reading ``attempts`` before writing safe: if the lease has since passed to
+    another relay the update matches nothing, which is the correct outcome.
     """
     if not failures:
         return 0
@@ -706,7 +710,9 @@ def mark_dead(session: Session, failures: Sequence[FailedEvent], *, instance_id:
     ``claim_batch`` takes only ``pending`` and ``reclaim_expired`` only ``publishing``.
     A dead row is therefore never picked up again, which is the loop this ends.
 
-    Per row for the same reason as ``reschedule_failed``: ``last_error`` differs.
+    Per row for the same reason as ``reschedule_failed``: ``last_error`` differs, and
+    the executemany form that would batch them cannot return the count the
+    ``locked_by`` guard needs.
     """
     if not failures:
         return 0
