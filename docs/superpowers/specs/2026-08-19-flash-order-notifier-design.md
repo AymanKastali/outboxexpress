@@ -318,7 +318,9 @@ The guarantee is therefore **effectively-once**, not exactly-once. Deduplication
 | `LEASE_SECONDS` | 60 | Must exceed worst-case publish plus the mark transaction. |
 | `delivery.timeout.ms` | 30 s | **Invariant: must be < `LEASE_SECONDS`.** |
 | `RECLAIM_INTERVAL` | 5 s | Scans `status='publishing' AND locked_until < now()`. |
-| Backoff | 1 s, ×2, cap 60 s, jittered | Jitter prevents N relays retrying in lockstep. |
+| Backoff | 1 s, ×2, cap 60 s, **full** jitter | `uniform(0, ceiling)`. Jitter prevents N relays retrying in lockstep. |
+
+Backoff is *full* jitter — `uniform(0, min(cap, base * 2**(attempts - 1)))` — carried by `RELAY_BACKOFF_BASE_SECONDS` and `RELAY_BACKOFF_CAP_SECONDS`. [AWS's measurements](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) put full jitter ahead of equal and decorrelated jitter on both total work and completion time, so it is the default rather than a variant. Its documented drawback is that the delay may collapse toward zero; that does not bite here, because a retriable failure has already spent `delivery.timeout.ms` before it is classified, so the delivery budget rather than the jitter is what paces a relay through an outage.
 
 `delivery.timeout.ms < LEASE_SECONDS` is a hard constraint. Violating it manufactures duplicates on every slow publish, because another relay reclaims the row while the first is still working on it. Tests override both to small values.
 
@@ -329,6 +331,18 @@ The common advice — "retry N times, then dead-letter" — is actively harmful 
 **Retriable** — `NOT_ENOUGH_REPLICAS`, transport failure, request timeout, leader-not-available. Retry **indefinitely** with capped, jittered backoff. Never dead-lettered. The backlog is the feature. The alert signal is `outbox_oldest_pending_seconds`, not an attempt count.
 
 **Non-retriable** — message too large, serialisation failure, invalid record. Set `status='dead'`, copy to `orders.events.dlq`, record `last_error`, move on **immediately**. Retrying a poison message a thousand times teaches nothing and blocks the batch.
+
+**The rule: dead-letter only when the message itself is the problem.** Everything that is a property of the *environment* — a broker down, a topic missing, an ACL not yet granted, a quota — retries indefinitely, because an operator can fix it and the outbox is the buffer that makes waiting survivable. Everything that is a property of the *message* — too large, corrupt, invalid, unserialisable — is dead-lettered at once, because no amount of waiting changes a payload. This is the same line [Kafka Connect draws for its DLQ](https://developer.confluent.io/courses/kafka-connect/error-handling-and-dead-letter-queues/): converter and transform failures are dead-lettered, infrastructure failures are not.
+
+The rule makes the poison set small, closed, and enumerable, while the environment set is open-ended. So the implementation is a **denylist and the default is retry**: `MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`, `INVALID_MESSAGE_SIZE`, `CORRUPT_MESSAGE`, `INVALID_RECORD`, and the two serialisation errors. Anything unrecognised waits.
+
+**Where this departs from librdkafka, and why.** librdkafka classifies `UNKNOWN_TOPIC_OR_PART`, `TOPIC_AUTHORIZATION_FAILED`, and `CLUSTER_AUTHORIZATION_FAILED` as *permanent* ([INTRODUCTION.md](https://github.com/confluentinc/librdkafka/blob/master/INTRODUCTION.md)); this design retries them. The two layers have different time horizons and the disagreement is only apparent: permanent to librdkafka means "I will not retry this inside `delivery.timeout.ms`", which is correct — 30 s will not conjure an ACL. The outbox's horizon is days, and over days a missing grant or a mistyped topic name is something a person fixes. Dead-lettering an entire backlog over a configuration typo is the failure this section opens by naming.
+
+Note also that Kafka's own protocol table marks `CORRUPT_MESSAGE` and `UNKNOWN_TOPIC_OR_PARTITION` retriable ([protocol error codes](https://kafka.apache.org/43/design/protocol)). That column describes the broker's view of a *request*, not a producer's view of a *record*: a corrupt record does not uncorrupt itself on resend, so librdkafka's reading wins for `CORRUPT_MESSAGE` and the horizon argument above wins for `UNKNOWN_TOPIC_OR_PART`.
+
+**The relay's backoff is a second tier, not the first.** librdkafka already retries retriable errors internally, invisibly, until `delivery.timeout.ms` expires, and then reports `_MSG_TIMED_OUT` — an umbrella code that *abstracts away* whichever broker error it kept hitting. Its own words: "only permanent errors and temporary errors that have reached their maximum retry count will generate a delivery report event." So a retriable delivery report means a full 30 s window was already spent failing. That is why the relay's backoff is measured in seconds rather than milliseconds, and why full jitter collapsing toward zero costs nothing: the delivery budget paces the relay whatever the jitter draws.
+
+**Not `KafkaError.retriable()`.** That flag is the *transactional* producer's categorisation (`rd_kafka_error_is_retriable`); every documented use of it sits inside a `commit_transaction` retry loop, and this design has no transactional producer (7.3). It is not set on delivery reports. Measured on confluent-kafka 2.15.0: a real delivery report from an unreachable broker carries `_MSG_TIMED_OUT` with `retriable()` false, and a hand-built `NOT_ENOUGH_REPLICAS` reports false as well. Classifying on that flag would dead-letter every broker outage — precisely the outcome this section exists to prevent. Classification is therefore by error **code**.
 
 `attempts` increments in both cases; it is the evidence during drills.
 
