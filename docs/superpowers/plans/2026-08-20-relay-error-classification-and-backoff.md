@@ -68,7 +68,7 @@ The second half fixes something plan 1 flagged and left. `producer.produce()` re
 - Consumes: `ClaimedEvent` (`relay/outbox.py`); the `broker` and `topic` fixtures; `an_event` and `header` (already in `tests/unit/test_relay_publisher.py`).
 - Produces: `is_retriable(error: KafkaError) -> bool` and `NON_RETRIABLE_CODES: frozenset[int]` in `relay/publisher.py`. `publish_batch`'s signature and return type are unchanged — only its behaviour on a local rejection changes.
 
-- [ ] **Step 1: Write the failing classification tests**
+- [x] **Step 1: Write the failing classification tests**
 
 Append to `tests/unit/test_relay_publisher.py`, and add `KafkaError` and `is_retriable` to its imports:
 
@@ -124,12 +124,12 @@ def test_classification_does_not_use_librdkafkas_transactional_flag() -> None:
     assert is_retriable(outage) is True
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/test_relay_publisher.py -v`
 Expected: FAIL — `ImportError: cannot import name 'is_retriable'`
 
-- [ ] **Step 3: Write the classification**
+- [x] **Step 3: Write the classification**
 
 In `src/outboxexpress/relay/publisher.py`, add `KafkaException` to the `confluent_kafka` import and insert after `log = get_logger(__name__)`:
 
@@ -184,12 +184,12 @@ def is_retriable(error: KafkaError) -> bool:
     return error.code() not in NON_RETRIABLE_CODES
 ```
 
-- [ ] **Step 4: Run the classification tests to verify they pass**
+- [x] **Step 4: Run the classification tests to verify they pass**
 
 Run: `uv run pytest tests/unit/test_relay_publisher.py -v`
 Expected: PASS, 5 new tests among them
 
-- [ ] **Step 5: Write the failing local-rejection test**
+- [x] **Step 5: Write the failing local-rejection test**
 
 Append to `tests/unit/test_relay_publisher.py`:
 
@@ -226,12 +226,12 @@ def test_a_locally_rejected_event_gets_a_verdict_and_its_siblings_still_publish(
     assert verdicts[good.event_id] is None
 ```
 
-- [ ] **Step 6: Run it to verify it fails**
+- [x] **Step 6: Run it to verify it fails**
 
 Run: `uv run pytest tests/unit/test_relay_publisher.py -k locally_rejected -v`
 Expected: FAIL with `KafkaException: KafkaError{code=MSG_SIZE_TOO_LARGE...}` — the exception escapes `publish_batch`
 
-- [ ] **Step 7: Capture the rejection as a verdict**
+- [x] **Step 7: Capture the rejection as a verdict**
 
 In `publish_batch`, replace the produce loop and the comment above it. The old comment justified the outer `finally` in terms of `produce()` raising mid-loop, which no longer happens, so it is rewritten rather than kept:
 
@@ -267,12 +267,12 @@ In `publish_batch`, replace the produce loop and the comment above it. The old c
             log.warning("publish_unreported", topic=topic, count=undelivered)
 ```
 
-- [ ] **Step 8: Run the publisher suite to verify it passes**
+- [x] **Step 8: Run the publisher suite to verify it passes**
 
 Run: `uv run pytest tests/unit/test_relay_publisher.py -v`
 Expected: PASS, all 11
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add src/outboxexpress/relay/publisher.py tests/unit/test_relay_publisher.py
@@ -296,7 +296,7 @@ The ceiling and the jitter are separate functions on purpose. The ceiling is the
 - Consumes: `Outbox`, `OutboxStatus` (`shared/models.py`); `claim_batch` and `mark_published` (same module); `write_pending_events`, `expire_leases`, `statuses`, `row_state`; the `relay_sessions` and `sync_engine` fixtures.
 - Produces: `FailedEvent(event_id: UUID, error: str)`, `retry_ceiling_seconds(attempts: int, *, base_seconds: float, cap_seconds: float) -> float`, `retry_delay(attempts: int, *, base_seconds: float, cap_seconds: float) -> timedelta`, and `reschedule_failed(session: Session, failures: Sequence[FailedEvent], *, instance_id: str, base_seconds: float, cap_seconds: float) -> int`. Settings `relay_backoff_base_seconds: float = 1.0` and `relay_backoff_cap_seconds: float = 60.0`.
 
-- [ ] **Step 1: Write the failing backoff-policy tests**
+- [x] **Step 1: Write the failing backoff-policy tests**
 
 Append to `tests/unit/test_relay_outbox.py`, adding `FailedEvent`, `retry_ceiling_seconds`, `retry_delay` to the `outboxexpress.relay.outbox` import and `from datetime import timedelta` at the top:
 
@@ -335,12 +335,12 @@ def test_the_delay_is_jittered_inside_the_ceiling() -> None:
     assert all(timedelta() <= delay <= timedelta(seconds=8) for delay in delays)
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/test_relay_outbox.py -v`
 Expected: FAIL — `ImportError: cannot import name 'retry_ceiling_seconds'`
 
-- [ ] **Step 3: Write the backoff policy**
+- [x] **Step 3: Write the backoff policy**
 
 In `src/outboxexpress/relay/outbox.py`, add `import random` at the top and append after `reclaim_expired`:
 
@@ -379,12 +379,12 @@ def retry_delay(attempts: int, *, base_seconds: float, cap_seconds: float) -> ti
     return timedelta(seconds=random.uniform(0, ceiling))
 ```
 
-- [ ] **Step 4: Run the policy tests to verify they pass**
+- [x] **Step 4: Run the policy tests to verify they pass**
 
 Run: `uv run pytest tests/unit/test_relay_outbox.py -k "ceiling or jittered" -v`
 Expected: PASS, 4 tests
 
-- [ ] **Step 5: Write the failing transition tests**
+- [x] **Step 5: Write the failing transition tests**
 
 Append to `tests/unit/test_relay_outbox.py`:
 
@@ -477,12 +477,12 @@ def test_rescheduling_nothing_touches_nothing(relay_sessions: sessionmaker[Sessi
         )
 ```
 
-- [ ] **Step 6: Run them to verify they fail**
+- [x] **Step 6: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/test_relay_outbox.py -v`
 Expected: FAIL — `ImportError: cannot import name 'reschedule_failed'`
 
-- [ ] **Step 7: Write the transition**
+- [x] **Step 7: Write the transition**
 
 In `src/outboxexpress/relay/outbox.py`, add `FailedEvent` below `ClaimedEvent`:
 
@@ -572,7 +572,7 @@ def reschedule_failed(
     return rescheduled
 ```
 
-- [ ] **Step 8: Add the two settings**
+- [x] **Step 8: Add the two settings**
 
 In `src/outboxexpress/shared/config.py`, after `relay_poll_interval_seconds`:
 
@@ -590,12 +590,12 @@ and extend `test_relay_settings_carry_the_values_the_spec_fixes` in `tests/unit/
     assert settings.relay_backoff_cap_seconds == 60.0
 ```
 
-- [ ] **Step 9: Run the outbox and config suites to verify they pass**
+- [x] **Step 9: Run the outbox and config suites to verify they pass**
 
 Run: `uv run pytest tests/unit/test_relay_outbox.py tests/unit/test_config.py -v`
 Expected: PASS, 20 and 4
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add src/outboxexpress/relay/outbox.py src/outboxexpress/shared/config.py \
@@ -617,7 +617,7 @@ The test that matters here is the third one. `dead` is worth having only because
 - Consumes: `FailedEvent`, `claim_batch`, `reclaim_expired` (same module); `expire_leases`, `row_state`; the `relay_sessions` and `sync_engine` fixtures.
 - Produces: `mark_dead(session: Session, failures: Sequence[FailedEvent], *, instance_id: str) -> int`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/unit/test_relay_outbox.py`, adding `mark_dead` to the import:
 
@@ -688,12 +688,12 @@ def test_marking_nothing_dead_touches_nothing(relay_sessions: sessionmaker[Sessi
         assert mark_dead(session, [], instance_id="relay-1") == 0
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `uv run pytest tests/unit/test_relay_outbox.py -v`
 Expected: FAIL — `ImportError: cannot import name 'mark_dead'`
 
-- [ ] **Step 3: Write the transition**
+- [x] **Step 3: Write the transition**
 
 Append to `src/outboxexpress/relay/outbox.py`:
 
@@ -743,12 +743,12 @@ def mark_dead(session: Session, failures: Sequence[FailedEvent], *, instance_id:
     return parked
 ```
 
-- [ ] **Step 4: Run the outbox suite to verify it passes**
+- [x] **Step 4: Run the outbox suite to verify it passes**
 
 Run: `uv run pytest tests/unit/test_relay_outbox.py -v`
 Expected: PASS, 24
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/outboxexpress/relay/outbox.py tests/unit/test_relay_outbox.py
@@ -771,7 +771,7 @@ git commit -m "feat: park a non-retriable outbox row as dead"
 - Consumes: `is_retriable` (`relay/publisher.py`); `FailedEvent`, `reschedule_failed`, `mark_dead` (`relay/outbox.py`); `statuses` (`tests/outbox_state.py`); the `relay_sessions`, `relay_settings`, `sync_engine` fixtures.
 - Produces: nothing new. `run_once`'s signature and its `int` return (rows retired) are unchanged, so plan 5's daemon is unaffected.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `tests/unit/test_relay_loop.py`, restore `text` to the `sqlalchemy` import (`from sqlalchemy import Engine, text`) — plan 2 removed it when `statuses` moved out. `KafkaError` and `statuses` are already imported. Then append:
 
@@ -857,7 +857,7 @@ and change the tail of `test_a_cycle_retires_only_the_events_the_broker_confirme
     assert statuses(sync_engine) == ["published", "dead"]
 ```
 
-- [ ] **Step 2: Run them, and note which one does not fail**
+- [x] **Step 2: Run them, and note which one does not fail**
 
 Run: `uv run pytest tests/unit/test_relay_loop.py -v`
 Expected: 2 failed, 8 passed.
@@ -866,7 +866,7 @@ Expected: 2 failed, 8 passed.
 - `test_a_cycle_retires_only_the_events_the_broker_confirmed` FAILS: `assert ['published', 'publishing'] == ['published', 'dead']`.
 - `test_an_event_with_no_verdict_keeps_its_lease_for_the_reclaimer` **passes already**, and that is the honest position rather than a TDD failure to paper over: an unreported event is the one case this plan deliberately does not change. It goes in as a regression guard, so that a later plan widening the routing cannot silently start resolving rows it has no verdict for.
 
-- [ ] **Step 3: Route the verdicts**
+- [x] **Step 3: Route the verdicts**
 
 In `src/outboxexpress/relay/loop.py`, extend the imports:
 
@@ -915,17 +915,17 @@ then replace everything from `delivered = [...]` to the end of `run_once`. The a
     return marked
 ```
 
-- [ ] **Step 4: Run the loop suite to verify it passes**
+- [x] **Step 4: Run the loop suite to verify it passes**
 
 Run: `uv run pytest tests/unit/test_relay_loop.py -v`
 Expected: PASS, 9
 
-- [ ] **Step 5: Run everything, then lint and type-check**
+- [x] **Step 5: Run everything, then lint and type-check**
 
 Run: `make test && make lint`
 Expected: PASS, 88 tests (68 before this plan: +6 publisher, +12 outbox, +2 loop; `test_config` and one loop test are modified rather than added). `ruff check .` clean, `pyright` 0 errors.
 
-- [ ] **Step 6: Prove the tests grip**
+- [x] **Step 6: Prove the tests grip**
 
 Two mutations, each run and then reverted. Back the files up first (`cp` to a scratch path) and restore them byte-identically after — `git diff` must be empty before committing.
 
@@ -934,7 +934,7 @@ Two mutations, each run and then reverted. Back the files up first (`cp` to a sc
 2. In `outbox.py`, change `_BACKOFF_EXPONENT_LIMIT` to `2_000`.
    Expected: `test_a_long_outage_does_not_overflow_the_ceiling` FAILS with `OverflowError`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/outboxexpress/relay/loop.py tests/unit/test_relay_loop.py
