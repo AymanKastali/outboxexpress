@@ -2,12 +2,13 @@
 
 import json
 
-from confluent_kafka import Message
+from confluent_kafka import KafkaError, Message
 
 from outboxexpress.relay.outbox import ClaimedEvent
 from outboxexpress.relay.publisher import (
     create_producer,
     flush_timeout_seconds,
+    is_retriable,
     producer_config,
     publish_batch,
 )
@@ -112,3 +113,86 @@ def test_an_unreachable_broker_reports_failure_rather_than_raising() -> None:
 
     assert len(outcomes) == 1
     assert outcomes[0].error is not None
+
+
+def test_a_broker_outage_is_retriable() -> None:
+    # The code a real delivery report actually carries when the broker is unreachable.
+    # Classifying this one as poison would dead-letter an entire outage, which is the
+    # single outcome spec 7.2 exists to prevent.
+    assert is_retriable(KafkaError(KafkaError._MSG_TIMED_OUT))
+    assert is_retriable(KafkaError(KafkaError._TRANSPORT))
+    assert is_retriable(KafkaError(KafkaError.NOT_ENOUGH_REPLICAS))
+    assert is_retriable(KafkaError(KafkaError.LEADER_NOT_AVAILABLE))
+    assert is_retriable(KafkaError(KafkaError.REQUEST_TIMED_OUT))
+
+
+def test_a_message_that_is_itself_the_problem_is_poison() -> None:
+    # No payload gets smaller, or less corrupt, by being retried.
+    assert not is_retriable(KafkaError(KafkaError.MSG_SIZE_TOO_LARGE))
+    assert not is_retriable(KafkaError(KafkaError.RECORD_LIST_TOO_LARGE))
+    assert not is_retriable(KafkaError(KafkaError.INVALID_RECORD))
+    # CORRUPT_MESSAGE. Kafka's protocol table marks this retriable, describing a
+    # broker re-reading a request; a record produced corrupt stays corrupt.
+    assert not is_retriable(KafkaError(KafkaError.INVALID_MSG))
+
+
+def test_a_fixable_environment_is_retriable_even_where_librdkafka_says_permanent() -> None:
+    # The deliberate departure, pinned so it reads as a decision and not an oversight.
+    # librdkafka calls these permanent, correctly, for its own 30-second horizon. The
+    # outbox's horizon is days, and a missing grant or a mistyped topic name is
+    # something a person fixes inside days. Dead-lettering a whole backlog over a
+    # config typo is the failure spec 7.2 opens by naming.
+    assert is_retriable(KafkaError(KafkaError.UNKNOWN_TOPIC_OR_PART))
+    assert is_retriable(KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED))
+    assert is_retriable(KafkaError(KafkaError.CLUSTER_AUTHORIZATION_FAILED))
+
+
+def test_an_unrecognised_error_is_retriable() -> None:
+    # The denylist's whole point: a code nobody classified waits rather than dies,
+    # because the poison side of the line is closed and this side is not.
+    assert is_retriable(KafkaError(KafkaError.UNKNOWN))
+    assert is_retriable(KafkaError(KafkaError.INVALID_REQUIRED_ACKS))
+
+
+def test_classification_does_not_use_librdkafkas_transactional_flag() -> None:
+    """Pins the finding in spec 7.2, so a later simplification fails here instead.
+
+    ``KafkaError.retriable()`` is the transactional API's categorisation and is not
+    set on delivery reports. Swapping ``is_retriable`` for it looks like a tidy-up
+    and would dead-letter every broker outage.
+    """
+    outage = KafkaError(KafkaError.NOT_ENOUGH_REPLICAS)
+    assert outage.retriable() is False
+    assert is_retriable(outage) is True
+
+
+def test_a_locally_rejected_event_gets_a_verdict_and_its_siblings_still_publish(
+    broker: str, topic: str
+) -> None:
+    # produce() checks the message size itself and raises rather than reporting, so
+    # without a verdict this event would leave publish_batch as an exception and the
+    # row would be reclaimed and retried for as long as the payload stays too big.
+    # librdkafka's default message.max.bytes is 1000000.
+    oversized = ClaimedEvent(
+        event_id=new_id(),
+        aggregate_id="order-7",
+        event_type="OrderCreated",
+        payload={"filler": "x" * 2_000_000},
+    )
+    good = an_event("order-8", 0)
+    settings = Settings(kafka_bootstrap_servers=broker)
+
+    outcomes = publish_batch(
+        create_producer(settings),
+        [oversized, good],
+        topic=topic,
+        timeout_seconds=flush_timeout_seconds(settings),
+    )
+
+    verdicts = {outcome.event_id: outcome.error for outcome in outcomes}
+    rejected = verdicts[oversized.event_id]
+    assert rejected is not None
+    assert rejected.code() == KafkaError.MSG_SIZE_TOO_LARGE
+    assert not is_retriable(rejected)
+    # The sibling is the point: one poison payload must not cost the other ninety-nine.
+    assert verdicts[good.event_id] is None
