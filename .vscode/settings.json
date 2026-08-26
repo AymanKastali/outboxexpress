@@ -1,0 +1,31 @@
+{
+  "cSpell.words": [
+    "cloudevents",
+    "datacontenttype",
+    "dedup",
+    "depguard",
+    "franz",
+    "golangci",
+    "goose",
+    "healthcheck",
+    "Hohpe",
+    "initdb",
+    "isready",
+    "jackc",
+    "Kastali",
+    "outboxctl",
+    "outboxexpress",
+    "PoEAA",
+    "reconstitutes",
+    "reconstructor",
+    "redpanda",
+    "redpandadata",
+    "slog",
+    "specversion",
+    "testcontainers",
+    "traceparent",
+    "twmb",
+    "upsert",
+    "Woolf"
+  ]
+}

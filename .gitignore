@@ -1,0 +1,16 @@
+# Build output
+/bin/
+*.exe
+
+# Test and coverage
+*.test
+coverage.out
+coverage.html
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.DS_Store
