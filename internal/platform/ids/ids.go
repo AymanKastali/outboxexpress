@@ -11,6 +11,6 @@ import "github.com/google/uuid"
 // _test.go — see the seqIDs type in Task 7 and staticIDs in Task 12.
 type UUIDv7 struct{}
 
-// NewV7 already returns uuid.Nil alongside its error, so there is nothing to
-// translate — this method exists only to name the port.
+// New mints a UUIDv7. uuid.NewV7 already returns uuid.Nil alongside its error,
+// so there is nothing to translate — this method exists only to name the port.
 func (UUIDv7) New() (uuid.UUID, error) { return uuid.NewV7() }

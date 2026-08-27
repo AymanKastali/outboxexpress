@@ -25,10 +25,17 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	platformpg "github.com/AymanKastali/outboxexpress/internal/platform/postgres"
 	"github.com/AymanKastali/outboxexpress/migrations"
 )
 
-const image = "postgres:18.6"
+const (
+	image = "postgres:18.6"
+
+	// poolMaxConns is per database, and tests within a binary run sequentially
+	// unless they opt into t.Parallel.
+	poolMaxConns = 4
+)
 
 // The container is started once and never terminated explicitly: testcontainers'
 // reaper removes it when the test binary exits, which is the only moment at
@@ -165,7 +172,10 @@ func open(c migrations.Context, database_ string) (database, error) {
 		return database{}, fmt.Errorf("pgtest: close migration connection: %w", closeErr)
 	}
 
-	pool, err := pgxpool.New(ctx, dsn)
+	// Through the project's own constructor, not pgxpool.New: a test suite that
+	// builds its pools differently from production leaves NewPool and
+	// DefaultPoolConfig unexercised by every integration test that needs a pool.
+	pool, err := platformpg.NewPool(ctx, platformpg.DefaultPoolConfig(dsn, poolMaxConns))
 	if err != nil {
 		return database{}, fmt.Errorf("pgtest: pool for %s: %w", database_, err)
 	}

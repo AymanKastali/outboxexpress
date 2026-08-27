@@ -17,7 +17,7 @@ func TestNewPool_ConnectsAndPings(t *testing.T) {
 	dsn, _ := pgtest.Accounts(t)
 	ctx := context.Background()
 
-	pool, err := platformpg.NewPool(ctx, dsn, 4)
+	pool, err := platformpg.NewPool(ctx, platformpg.DefaultPoolConfig(dsn, 4))
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}

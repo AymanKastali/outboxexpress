@@ -3,28 +3,24 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func NewPool(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, error) {
-	if maxConns <= 0 {
-		return nil, fmt.Errorf("postgres: maxConns must be positive, got %d", maxConns)
+func NewPool(ctx context.Context, poolCfg PoolConfig) (*pgxpool.Pool, error) {
+	if err := poolCfg.validate(); err != nil {
+		return nil, err
 	}
-	cfg, err := pgxpool.ParseConfig(dsn)
+	cfg, err := pgxpool.ParseConfig(poolCfg.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse dsn: %w", err)
 	}
-	cfg.MaxConns = maxConns
-	// A warm floor, so that the first registration after an idle period does not
-	// pay TCP connect, startup and auth inside a user-facing request. NewPool
-	// already blocks on Ping, so this work happens where it belongs.
-	cfg.MinConns = 2
-	cfg.MaxConnLifetime = time.Hour
-	cfg.MaxConnIdleTime = 5 * time.Minute
-	cfg.HealthCheckPeriod = 30 * time.Second
+	cfg.MaxConns = poolCfg.MaxConns
+	cfg.MinConns = poolCfg.MinConns
+	cfg.MaxConnLifetime = poolCfg.MaxConnLifetime
+	cfg.MaxConnIdleTime = poolCfg.MaxConnIdleTime
+	cfg.HealthCheckPeriod = poolCfg.HealthCheckPeriod
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
