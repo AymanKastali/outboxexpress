@@ -224,7 +224,7 @@ The notifier and the sender are split the same way.
 
 | Piece | Layer | Responsibility |
 |---|---|---|
-| `domain.EventSource` — `PullEvents() []Event` | domain | Aggregates record events on themselves, knowing nothing of tables or brokers. |
+| `domain.User.PullEvents() []Event` | domain | Aggregates record events on themselves, knowing nothing of tables or brokers. `domain.Event` exposes routing only — `EventType`, `AggregateType`, `AggregateID`, `OccurredAt`; the schema version belongs to the message contract and is named by `mapData`. The draining interface is declared at its consumer, in `infrastructure/postgres`, not exported by the domain. |
 | `application.UnitOfWork` — `Do(ctx, Metadata, func(Work) error) error` | application | The transaction boundary a use case sees. `Work` hands out repositories bound to that transaction. |
 | `application.EnvelopeFactory` | application | Maps domain events to CloudEvents envelopes. The message contract is an application concern. |
 | `infrastructure/postgres.UnitOfWork` | infrastructure | Opens the transaction, tracks aggregates the repositories touch, drains their events, appends outbox rows, commits. §5: "The outbox insert lives in the persistence layer. The domain never imports it." |
@@ -262,7 +262,7 @@ and each context maps it to and from its own types at the edge.
 | **Database** | `oe_accounts` | `oe_notifications` |
 | **Schema within it** | `accounts` | `notifications` |
 | **Tables** | `users`, `outbox` | `inbox`, `notifications`, `outbox` |
-| **Domain** | `User` aggregate, `UserRegistered` event | `Notification` aggregate, `WelcomeEmailRequested` event |
+| **Domain** | `User` aggregate, `Email` / `DisplayName` value objects, `UserRegistered` event | `Notification` aggregate, `Recipient` / `UserRef` / `NotificationState` value objects, `WelcomeEmailRequested` event |
 | **Domain repository** | `domain.UserRepository` | `domain.NotificationRepository` |
 | **Application ports** | `OutboxRepository`, `UnitOfWork`, `EnvelopeFactory`, `EventPublisher`, `Wakeup`, `Chaos`, `Clock`, `IDGen` | `InboxRepository`, `OutboxRepository`, `UnitOfWork`, `EnvelopeFactory`, `EmailGateway`, `DeadLetterPublisher`, `Chaos`, `Clock`, `IDGen` |
 | **Knows about the other** | Nothing. Produces to a topic. | Nothing. Consumes a topic. Never calls back into accounts. |
@@ -332,6 +332,11 @@ The reference schema of §4, unchanged. What each column is load-bearing for:
 - **`aggregate_type` / `aggregate_id`** are columns, not payload fields, because
   the relay routes on them and must never parse business content.
   `aggregate_type` selects the topic; `aggregate_id` becomes the partition key.
+- **`schema_version`** is a column for a different reason: nothing routes on it,
+  but the relay composes it into a header (§9.2) and must do so without opening
+  the payload. It is supplied by the envelope factory, not by the domain event —
+  a wire schema version is message contract, and one domain event type returning
+  one fixed version would make §9.3's dual-publish migration inexpressible.
 - **`payload JSONB`** holds the message already serialised into final published
   form. `JSONB` over `BYTEA` deliberately: §4 recommends it wherever you may need
   to read the table during an incident.
@@ -411,6 +416,16 @@ produce two notification rows.
 `idempotency_key` on the consumer's outbox is the inbound `event_id`. It is a
 column rather than a payload field for the same reason as the accounts outbox:
 the sender relay is a dumb pipe and routes on columns.
+
+**`state` is a domain type, not a string.** The `CHECK` constraint is the
+database's backstop, not the definition of the state machine. `Notification`
+owns a `NotificationState` value object and the transitions are methods on the
+aggregate — `MarkSent(at)`, `MarkFailed(reason)` — each refusing an illegal move
+(`sent` is terminal; `pending` is the only legal predecessor of either). A bare
+`state string` field would leave the rules in three places at once: the CHECK,
+whatever the sender does before its `UPDATE`, and the reader's memory. The rule
+is the same one §5 applies to the outbox insert — an invariant that lives in a
+call site is an invariant someone can forget.
 
 ### 8.3 Migrations
 
@@ -688,12 +703,21 @@ at-least-once, why `event_id` must be stable, and why §11.3 is not optional.
 ```go
 // notifications/application/process_user_registered.go
 func (uc *ProcessUserRegistered) Execute(ctx context.Context, msg messaging.Message) (ProcessResult, error) {
-    evt, err := decode(msg.Payload)
+    // The anti-corruption layer. accounts' published language is translated into
+    // this context's own vocabulary here, and nowhere else; no domain code below
+    // this line has ever seen what accounts calls its fields. A decoded envelope
+    // handed straight to a notifications constructor would make this context a
+    // Conformist — its model defined by a schema another team owns.
+    req, err := uc.translate(msg)
     if err != nil {
         return ProcessResult{}, fmt.Errorf("%w: %v", ErrPermanent, err)   // -> DLT
     }
 
-    notif := notification.NewWelcome(uc.ids.New(), evt, msg.EventID, uc.clock.Now())
+    notif, err := notification.RequestWelcome(
+        uc.ids.New(), req.Recipient, req.User, req.SourceEventID, uc.clock.Now())
+    if err != nil {
+        return ProcessResult{}, fmt.Errorf("%w: %v", ErrPermanent, err)   // -> DLT
+    }
 
     var duplicate bool
     err = uc.uow.Do(ctx, msg.Metadata(), func(w Work) error {
@@ -720,6 +744,30 @@ func (uc *ProcessUserRegistered) Execute(ctx context.Context, msg messaging.Mess
 One transaction, three writes: the inbox row, the notification row, and — drained
 structurally by the same unit of work — the send-intent row in
 `notifications.outbox`. Then, and only then, the worker commits the offset.
+
+**The translator is the boundary.** `uc.translate` lives in
+`notifications/application/translate.go` and returns notifications-owned types:
+
+```go
+type WelcomeRequest struct {
+    Recipient     notification.Recipient    // this context's email value object
+    User          notification.UserRef      // a foreign aggregate, referenced by id
+    SourceEventID uuid.UUID
+}
+```
+
+It is the only code in the context that knows accounts' field names, so an
+additive change to `com.outboxexpress.accounts.user.registered` is absorbed in
+one file rather than reaching the `Notification` aggregate. `UserRef` is an id
+and nothing else: accounts' `User` is a different aggregate in a different
+context, and holding a copy of it here would be one model with a network in the
+middle. A missing or malformed field is `ErrPermanent` — the message will never
+become valid, so it belongs on the dead-letter topic, not in a retry loop.
+
+This is the inbound half of what §9.1 already does outbound. The CloudEvents
+factory is an Open Host Service publishing a stable language; the translator is
+the Anti-Corruption Layer that consumes one. A context with only the first half
+exports its model and imports someone else's.
 
 Why atomicity here is not optional (§13):
 
@@ -1025,7 +1073,7 @@ startup, refusing to start on an invalid value. No configuration library.
 | **Application** | Fakes for every port, injected clock and ids | Backoff arithmetic; a transient error breaks the batch and a permanent one does not; a transient error never reaches `failed`; duplicates short-circuit before any work; publish order follows `id`. |
 | **Integration — Postgres** | `testcontainers-go`, PostgreSQL 18.6 | The unit of work drains events without the use case asking (register, assert one pending row); two concurrent relays claim disjoint rows under `SKIP LOCKED`; a killed relay's locks release and its rows are reclaimed; `ON CONFLICT` inbox returns "not first"; abort mid-transaction and assert *neither* row exists. |
 | **Integration — Kafka** | `testcontainers-go` Kafka module, real broker | `acks=all` is awaited before marking; key routing puts one user's events on one partition; offsets are committed only after the database commit; a DLT record carries the original value and headers. |
-| **Fault injection** | The §12.5 hooks against real infrastructure | Crash after publish → same `event_id` twice → one notification, one send, `inbox_duplicates_skipped_total` + 1. Crash before offset commit → redelivery absorbed. Gateway 503 → intent retried and eventually sent. Broker stopped mid-run → rows accumulate, `POST /users` keeps returning 201, everything drains on restart with nothing lost. |
+| **Fault injection** | The §12.5 hooks against real infrastructure | Crash after publish → same `event_id` twice → one notification, one send, and the notifier logs a `duplicate=true` pass (§13.3). Crash before offset commit → redelivery absorbed. Gateway 503 → intent retried and eventually sent. Broker stopped mid-run → rows accumulate, `POST /users` keeps returning 201, everything drains on restart with nothing lost. |
 | **End-to-end invariant** | 500 registrations while the relay and notifier are killed at random | `count(users) == count(notifications) == count(distinct inbox.event_id)`; every notification reaches `sent`; no row left `pending`; and the gateway *delivered* at most one email per `Idempotency-Key` — it may well have been *called* more than once with the same key, which is precisely what the key is for. This is the test that would catch a broken implementation. |
 | **Architecture** | `go/packages` import walk | The layer and context rules of §6.2, plus per-context pool wiring. |
 
