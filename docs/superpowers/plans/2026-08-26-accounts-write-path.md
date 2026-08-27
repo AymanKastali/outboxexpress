@@ -301,8 +301,8 @@ git commit -m "chore: module, Makefile and PostgreSQL 18.6 with both service dat
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `type API struct { AccountsDatabaseURL, HTTPAddr, AdminAddr, LogLevel string }`
-  - `type Migrate struct { AccountsDatabaseURL, NotificationsDatabaseURL, LogLevel string }`
+  - `type API struct { AccountsDatabaseURL, HTTPAddr, AdminAddr string; LogLevel slog.Level }`
+  - `type Migrate struct { AccountsDatabaseURL, NotificationsDatabaseURL string; LogLevel slog.Level }`
   - `func LoadAPI(getenv func(string) string) (API, error)`
   - `func LoadMigrate(getenv func(string) string) (Migrate, error)`
   - `var ErrMissing = errors.New("config: required variable is empty")`
@@ -530,7 +530,7 @@ func logLevel(getenv func(string) string) (slog.Level, error) {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `go test ./internal/platform/config/ -v`
-Expected: PASS for all six test functions.
+Expected: PASS for all five test functions.
 
 - [ ] **Step 5: Commit**
 
