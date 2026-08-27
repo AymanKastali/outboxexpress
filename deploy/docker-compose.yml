@@ -28,5 +28,56 @@ services:
       - -c
       - log_min_duration_statement=200ms
 
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: oe-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      # PLAINTEXT is what the host reaches on 9092; BROKER is what anything
+      # inside the compose network uses. A relay running in a container talks to
+      # kafka:9094, a relay running from `make run-relay` talks to
+      # localhost:9092, and both are the same broker.
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,BROKER://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,BROKER://kafka:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,BROKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      # One broker, so nothing can be replicated further than one. Spec §9.2 is
+      # explicit that this demo therefore cannot provide §7's durability floor
+      # (acks=all *with* min.insync.replicas >= 2 and RF >= 3), and README.md
+      # says so out loud.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      # Spec §12.1 needs UNKNOWN_TOPIC_OR_PARTITION to be a permanent error,
+      # which it only is if the broker will not quietly invent the topic instead.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+    healthcheck:
+      # Asked over the internal listener, because the advertised PLAINTEXT
+      # address points at the host and is not reachable from inside.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9094 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+
+  kafka-init:
+    image: apache/kafka:4.3.1
+    container_name: oe-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./kafka-init.sh:/kafka-init.sh:ro
+    entrypoint: ["/usr/bin/env", "bash", "/kafka-init.sh"]
+    restart: "no"
+
 volumes:
   pgdata:
+  kafkadata:

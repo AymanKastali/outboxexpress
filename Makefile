@@ -5,7 +5,17 @@ export GOTOOLCHAIN := auto
 
 COMPOSE := docker compose -f deploy/docker-compose.yml
 
-.PHONY: build test test-integration lint fmt db-up db-down db-logs migrate run-api
+.PHONY: build test test-integration lint fmt up db-up db-down db-logs kafka-up topics migrate run-api
+
+up: db-up kafka-up topics
+
+kafka-up:
+> $(COMPOSE) up -d --wait kafka
+
+# A one-shot, so `run --rm` rather than `up`: its exit code is the result, and
+# leaving a stopped container behind makes `docker compose ps` misleading.
+topics:
+> $(COMPOSE) run --rm kafka-init
 
 build:
 > go build ./...
