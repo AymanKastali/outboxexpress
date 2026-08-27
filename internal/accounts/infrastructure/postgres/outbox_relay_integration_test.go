@@ -371,6 +371,89 @@ func TestStats_AnEmptyOutboxHasNoOldestRow(t *testing.T) {
 	}
 }
 
+// Spec §13.2's delete, and what it must leave alone.
+func TestPurgePublished_DeletesOnlyPublishedRowsPastRetention(t *testing.T) {
+	_, pool := pgtest.Accounts(t)
+	ctx := context.Background()
+
+	old := seed(t, pool, row{Aggregate: "ada", Status: "published", PublishedAgo: 48 * time.Hour})
+	recent := seed(t, pool, row{Aggregate: "grace", Status: "published"})
+	parked := seed(t, pool, row{Aggregate: "alan", Status: "failed", Attempts: 3})
+	waiting := seed(t, pool, row{Aggregate: "linus"})
+
+	deleted, err := NewOutboxPurger(pool).
+		PurgePublished(ctx, 24*time.Hour, 1000)
+	if err != nil {
+		t.Fatalf("PurgePublished: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+
+	// The row past retention is the one that had to go. A count of 1 alone does
+	// not say *which* row was deleted, and deleting the wrong one would satisfy
+	// it just as well.
+	var stillThere bool
+	if err := pool.QueryRow(ctx,
+		`SELECT exists(SELECT 1 FROM accounts.outbox WHERE id = $1)`, old).Scan(&stillThere); err != nil {
+		t.Fatalf("exists %d: %v", old, err)
+	}
+	if stillThere {
+		t.Errorf("row %d survived; it was published 48h ago against a 24h retention", old)
+	}
+
+	for _, survivor := range []struct {
+		id  int64
+		why string
+	}{
+		{recent, "published inside the retention window"},
+		{parked, "failed rows are never purged automatically"},
+		{waiting, "still pending"},
+	} {
+		var exists bool
+		if err := pool.QueryRow(ctx,
+			`SELECT exists(SELECT 1 FROM accounts.outbox WHERE id = $1)`, survivor.id).Scan(&exists); err != nil {
+			t.Fatalf("exists %d: %v", survivor.id, err)
+		}
+		if !exists {
+			t.Errorf("row %d was deleted but should not have been: %s", survivor.id, survivor.why)
+		}
+	}
+}
+
+// The bound is what makes the purge safe, so it is asserted rather than assumed.
+func TestPurgePublished_RespectsTheBatchLimit(t *testing.T) {
+	_, pool := pgtest.Accounts(t)
+	ctx := context.Background()
+
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		seed(t, pool, row{Aggregate: name, Status: "published", PublishedAgo: 48 * time.Hour})
+	}
+
+	// Only the bound, and only once: what needs a database here is that LIMIT
+	// reaches the DELETE at all. That the caller repeats until a page comes back
+	// short is the use case's property and is already asserted against a fake in
+	// TestPurgePublished_RepeatsUntilAShortPage — re-implementing the loop here
+	// would put the same logic in two places and give this test a second,
+	// unrelated way to fail.
+	deleted, err := NewOutboxPurger(pool).PurgePublished(ctx, 24*time.Hour, 2)
+	if err != nil {
+		t.Fatalf("PurgePublished: %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("deleted = %d, want 2 — the limit is not being applied, and an "+
+			"unbounded delete is the long lock §13.2 exists to avoid", deleted)
+	}
+	var left int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM accounts.outbox`).Scan(&left); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if left != 3 {
+		t.Errorf("rows left = %d, want 3", left)
+	}
+}
+
 // --- helpers -----------------------------------------------------------------
 
 // row is what a seeded outbox row differs from the ordinary case by. Its zero

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/AymanKastali/outboxexpress/internal/accounts/application"
 )
@@ -220,3 +221,65 @@ SELECT
       WHERE status = 'pending' AND attempts >= $1)                  AS stuck_rows`
 
 var _ application.OutboxRepository = (*RelayOutbox)(nil)
+
+// purgePublished is the delete of spec §13.2.
+//
+// PostgreSQL has no DELETE … LIMIT, so the bound goes in a subquery. ORDER BY id
+// inside it means each page takes the oldest rows, so the work is done in index
+// order and a run that is interrupted has still made progress at the front.
+//
+// status = 'published' is what keeps failed rows out. §13.2: "failed rows are
+// never purged automatically" — a parked row is the only record that something
+// needs a human, and a retention job is not the thing that should decide nobody
+// is coming.
+//
+// make_interval(secs => $1) rather than $1::interval, because binding an interval
+// means formatting a Go duration into PostgreSQL's interval syntax as text.
+// make_interval takes a number, so the duration crosses as a float and no string
+// is built.
+const purgePublished = `
+DELETE FROM accounts.outbox
+ WHERE id IN (
+    SELECT id
+      FROM accounts.outbox
+     WHERE status = 'published'
+       AND published_at < now() - make_interval(secs => $1)
+     ORDER BY id
+     LIMIT $2
+ )`
+
+// outbox_purge_idx (published_at, id) WHERE status = 'published' is what keeps
+// this off a full scan when nothing is eligible — a fresh deploy, a quiet night,
+// or a retention that was just raised. In the steady state the eligible rows sit
+// at the front of the table and it stops early either way; it is the empty case
+// that runs once a minute forever.
+
+// OutboxPurger is the third lifetime this table has, and the reason it is a third
+// type rather than another method on RelayOutbox: §13.2 requires each bounded
+// delete to be its own short transaction, so this one is pool-bound by
+// construction. RelayOutbox takes a pgx.Tx precisely so that a claim or a mark
+// cannot happen outside a transaction; the purge is the opposite requirement, and
+// putting both on one type would leave neither enforced.
+type OutboxPurger struct {
+	pool *pgxpool.Pool
+}
+
+func NewOutboxPurger(pool *pgxpool.Pool) *OutboxPurger {
+	return &OutboxPurger{pool: pool}
+}
+
+// PurgePublished deletes up to limit eligible rows and returns how many it
+// removed. The caller loops (see application.PurgePublished) until a page comes
+// back short.
+//
+// Each call is its own implicit transaction — pool.Exec, no BEGIN — which is what
+// §13.2 asks for: the lock is held for one bounded delete and no longer.
+func (r *OutboxPurger) PurgePublished(ctx context.Context, retention time.Duration, limit int) (int, error) {
+	tag, err := r.pool.Exec(ctx, purgePublished, retention.Seconds(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: purge published outbox rows: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+var _ application.OutboxPurger = (*OutboxPurger)(nil)
