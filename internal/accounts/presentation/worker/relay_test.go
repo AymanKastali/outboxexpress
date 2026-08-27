@@ -107,7 +107,7 @@ func TestRelay_LogsOnePassLineWithEveryFieldOperationsNeeds(t *testing.T) {
 		Published: 5,
 		Transient: []application.Failure{{OutboxID: 11, EventID: uuid.New(), Reason: "NOT_ENOUGH_REPLICAS"}},
 		Permanent: []application.Failure{{OutboxID: 12, EventID: uuid.New(), Reason: "RECORD_LIST_TOO_LARGE"}},
-		Stats: application.PassStats{
+		Stats: application.OutboxStats{
 			Backlog:          42,
 			OldestPendingAge: 1500 * time.Millisecond,
 			FailedRows:       3,
@@ -342,7 +342,11 @@ func TestRelay_StopsCleanlyWhenTheContextEnds(t *testing.T) {
 func TestRelay_KeepsGoingAfterAFailedPass(t *testing.T) {
 	var out bytes.Buffer
 	wake := &fakeWaiter{}
-	pass := &fakePass{err: errors.New("connection reset"), stopAfter: 3}
+	pass := &fakePass{
+		err:       errors.New("connection reset"),
+		errResult: application.PublishResult{Claimed: 5, Published: 2, BatchSize: 100},
+		stopAfter: 3,
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	pass.stop = cancel
@@ -360,6 +364,12 @@ func TestRelay_KeepsGoingAfterAFailedPass(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"level":"ERROR"`) {
 		t.Error("a failed pass produced no ERROR line")
+	}
+	// The count of messages the broker already has, whose marks rolled back. It
+	// is the only figure a failed pass can offer an operator, and it used to be
+	// dropped on the floor with the rest of the result.
+	if line := findLine(t, out.String(), "relay pass rolled back; every row it claimed is still pending"); line["republish_on_retry"] != float64(2) {
+		t.Errorf("republish_on_retry = %v, want 2", line["republish_on_retry"])
 	}
 	// It must back off the long way, not retry at IdleMin against a database
 	// that is already unhappy.
@@ -387,6 +397,7 @@ func newRelay(t *testing.T, pass *fakePass, wake Waiter, out *bytes.Buffer) *Rel
 type fakePass struct {
 	results   []application.PublishResult
 	err       error
+	errResult application.PublishResult // what the failing pass observed before it failed
 	stopAfter int
 	calls     int
 	stop      context.CancelFunc
@@ -402,7 +413,7 @@ func (f *fakePass) Execute(context.Context) (application.PublishResult, error) {
 		defer f.stop()
 	}
 	if f.err != nil {
-		return application.PublishResult{}, f.err
+		return f.errResult, f.err
 	}
 	if n <= len(f.results) {
 		return f.results[n-1], nil

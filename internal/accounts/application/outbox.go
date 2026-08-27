@@ -49,10 +49,6 @@ type OutboxRepository interface {
 
 	// MarkFailed parks a row a human has to look at.
 	MarkFailed(ctx context.Context, id int64, lastError string) error
-
-	// Stats reads the pass line's backlog fields. maxAttempts is the threshold
-	// above which a still-retrying row is counted as stuck.
-	Stats(ctx context.Context, maxAttempts int) (PassStats, error)
 }
 
 // PendingMessage is one claimed outbox row as the relay sees it: the routing
@@ -72,23 +68,51 @@ type PendingMessage struct {
 	Attempts int
 }
 
-// PassStats is what one pass can see of the outbox table as a whole (spec §13.3).
+// OutboxStats is the state of the outbox table as a whole: the backlog fields of
+// spec §13.3, which are the only view an operator gets of whether the relay is
+// winning.
 //
-// It comes from a single query issued on the transaction the pass has already
-// opened, so observation costs one round trip rather than a background collector
-// holding its own connection.
+// Every field here is a fact about the table and nothing else — which is why it
+// is not called PassStats. It describes the outbox, not the pass; PublishResult
+// is the pass's own statistics, and nesting one inside the other under two names
+// that both said "stats of the pass" left one of them lying.
 //
-// Every field here is a fact about the outbox table and nothing else.
 // pg_notification_queue_usage() — which §13.3 also wants on the pass line — is
-// deliberately *not* here: it is the health of the wakeup mechanism, so the
-// component that owns that mechanism reports it (see the Usage method on the
-// wakeup port in Task 7). Sourcing it from this query would put a notify-
-// subsystem read inside the delivery transaction, which is the inversion §13.1
-// exists to forbid, and would keep charging for it under RELAY_USE_NOTIFY=false
-// where there is no listener at all.
-type PassStats struct {
+// deliberately absent. It is the health of the wakeup mechanism, so the component
+// that owns that mechanism reports it (see the Usage method on the wakeup port in
+// presentation/worker). Sourcing it from this query would keep charging for it
+// under RELAY_USE_NOTIFY=false, where there is no listener at all.
+type OutboxStats struct {
 	Backlog          int
 	OldestPendingAge time.Duration
 	FailedRows       int
 	StuckRows        int
+}
+
+// OutboxStatsReader reads OutboxStats. It is a second port over the same table,
+// and it is pool-bound rather than transaction-bound. That is the whole point.
+//
+// The obvious design puts Stats on OutboxRepository and issues it on the
+// transaction the pass has already opened, which is what §13.3 describes and
+// what this code did. It is one round trip cheaper and it is wrong, because
+// inside a transaction there is no such thing as a tolerable failure. PostgreSQL
+// aborts a transaction on any statement error, so a statement_timeout on this
+// query — and this is the query that gets slow, because counting the backlog
+// costs the backlog — leaves the commit that would have marked a durably-acked
+// batch returning ErrTxCommitRollback instead. Every message in that batch is
+// then published a second time because a count of rows could not be read.
+//
+// §13.1 states the rule for the wakeup: "an optimisation, never the delivery
+// path." Observation is the same rule's other half, and this port is what makes
+// it structural — there is no transaction in scope here to abort.
+//
+// Reading after the commit also makes the numbers honest. Read inside the
+// transaction they described a state that had not happened yet and might never:
+// a backlog that excluded rows the pass had marked, in a pass that then rolled
+// back.
+type OutboxStatsReader interface {
+	// Read reports the table's state. maxAttempts is the threshold above which a
+	// still-retrying row is counted as stuck (§12.1: an alert threshold, not a
+	// state transition).
+	Read(ctx context.Context, maxAttempts int) (OutboxStats, error)
 }

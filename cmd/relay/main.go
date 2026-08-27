@@ -95,6 +95,10 @@ func run() error {
 	publishPass := application.NewPublishPendingBatch(
 		accountspg.NewPublishUnitOfWork(pool),
 		accountskafka.NewPublisher(kafkaClient),
+		// On the pool, deliberately: the backlog count must not be able to abort
+		// the transaction that marks a published batch. See
+		// application.OutboxStatsReader.
+		accountspg.NewOutboxStatsReader(pool),
 		// The routing table of §9.2. One entry, because this context has one
 		// aggregate type — which is exactly why KAFKA_TOPIC is a single
 		// variable and not a map somebody has to parse.

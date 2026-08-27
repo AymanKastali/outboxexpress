@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"strconv"
 	"testing"
@@ -40,8 +39,9 @@ func TestPublishPendingBatch_PublishesEveryClaimedRowInIDOrder(t *testing.T) {
 		t.Errorf("publish order = %v, want %v", got, want)
 	}
 
-	// Every mark follows its own publish, and stats close the pass.
-	wantOps := []string{"claim", "published", "published", "published", "stats"}
+	// Every mark follows its own publish, and nothing else touches the
+	// transaction — the stats read is not on it.
+	wantOps := []string{"claim", "published", "published", "published"}
 	if got := f.outbox.ops(); !slices.Equal(got, wantOps) {
 		t.Errorf("calls = %v, want %v", got, wantOps)
 	}
@@ -157,7 +157,7 @@ func TestPublishPendingBatch_ATransientFailureStopsTheBatchAndReschedules(t *tes
 		t.Errorf("commits = %d, want 1 — a transient failure is not a failed pass", f.uow.commits)
 	}
 	// And stats are still read, so a stalling relay is still visible.
-	if len(f.outbox.callsOf("stats")) != 1 {
+	if f.stats.reads != 1 {
 		t.Error("stats were not read on a pass that broke early")
 	}
 }
@@ -189,7 +189,7 @@ func TestPublishPendingBatch_APermanentFailureParksTheRowAndKeepsGoing(t *testin
 		t.Error("failure reason is empty; the alert would say nothing")
 	}
 
-	wantOps := []string{"claim", "published", "failed", "published", "stats"}
+	wantOps := []string{"claim", "published", "failed", "published"}
 	if got := f.outbox.ops(); !slices.Equal(got, wantOps) {
 		t.Errorf("calls = %v, want %v", got, wantOps)
 	}
@@ -250,9 +250,17 @@ func TestPublishPendingBatch_AnUnclassifiedErrorAbandonsThePass(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the adapter's error", err)
 	}
-	// DeepEqual, not !=: PublishResult carries two slices, so it is not comparable.
-	if !reflect.DeepEqual(res, PublishResult{}) {
-		t.Errorf("result = %+v, want the zero value — a pass that rolled back observed nothing", res)
+	// The result still describes what happened. It has to: on a rolled-back pass
+	// Published is the count of messages the broker durably accepted and whose
+	// marks were just undone, which is the number of duplicates the next pass
+	// will produce. Here the first row failed before any ack, so it is zero — and
+	// the claim is still reported, because the rows were claimed.
+	if res.Claimed != 2 || res.Published != 0 {
+		t.Errorf("claimed=%d published=%d, want 2 and 0", res.Claimed, res.Published)
+	}
+	if res.Stats != (OutboxStats{}) || res.StatsErr != nil {
+		t.Errorf("stats = %+v / %v, want neither on a pass that rolled back",
+			res.Stats, res.StatsErr)
 	}
 	if f.uow.commits != 0 || f.uow.rollbacks != 1 {
 		t.Errorf("commits=%d rollbacks=%d, want 0 and 1", f.uow.commits, f.uow.rollbacks)
@@ -270,7 +278,7 @@ func TestPublishPendingBatch_AnUnclassifiedErrorAbandonsThePass(t *testing.T) {
 // assertable at all.
 func TestPublishPendingBatch_ReportsTheStatsOfThePass(t *testing.T) {
 	f := newPass(t, []PendingMessage{row(1, 0)}, 100)
-	f.outbox.stats = PassStats{
+	f.stats.stats = OutboxStats{
 		Backlog:          42,
 		OldestPendingAge: 1500 * time.Millisecond,
 		FailedRows:       2,
@@ -281,8 +289,11 @@ func TestPublishPendingBatch_ReportsTheStatsOfThePass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if res.Stats != f.outbox.stats {
-		t.Errorf("stats = %+v, want %+v", res.Stats, f.outbox.stats)
+	if res.Stats != f.stats.stats {
+		t.Errorf("stats = %+v, want %+v", res.Stats, f.stats.stats)
+	}
+	if res.StatsErr != nil {
+		t.Errorf("StatsErr = %v, want nil", res.StatsErr)
 	}
 }
 
@@ -290,7 +301,7 @@ func TestPublishPendingBatch_ReportsTheStatsOfThePass(t *testing.T) {
 // observable: no publish, one stats read, one commit.
 func TestPublishPendingBatch_AnEmptyOutboxStillReportsTheBacklog(t *testing.T) {
 	f := newPass(t, nil, 100)
-	f.outbox.stats = PassStats{Backlog: 0, FailedRows: 3}
+	f.stats.stats = OutboxStats{Backlog: 0, FailedRows: 3}
 
 	res, err := f.uc.Execute(context.Background())
 	if err != nil {
@@ -303,8 +314,8 @@ func TestPublishPendingBatch_AnEmptyOutboxStillReportsTheBacklog(t *testing.T) {
 		t.Errorf("failed_rows = %d, want 3 — an idle relay is exactly when a parked "+
 			"row needs to still be visible", res.Stats.FailedRows)
 	}
-	if got := f.outbox.ops(); !slices.Equal(got, []string{"claim", "stats"}) {
-		t.Errorf("calls = %v, want claim then stats", got)
+	if got := f.outbox.ops(); !slices.Equal(got, []string{"claim"}) {
+		t.Errorf("calls = %v, want a claim and nothing else", got)
 	}
 }
 
@@ -337,18 +348,75 @@ func TestPublishPendingBatch_StampsTheBatchSizeItUsed(t *testing.T) {
 	}
 }
 
-// A failure to read stats fails the pass. The alternative — commit the marks and
-// return zeroed stats — would publish a batch and then report a zero backlog,
-// which is indistinguishable from a healthy idle relay.
-func TestPublishPendingBatch_AStatsFailureFailsThePass(t *testing.T) {
+// The headline property of moving the stats read off the transaction: counting
+// rows can no longer undo delivery.
+//
+// This test used to assert the opposite, and the argument for it was real — a
+// pass that reports a zero backlog it never read is indistinguishable from a
+// healthy idle relay. But the price was that a statement_timeout on the one query
+// whose cost grows with the backlog would abort the transaction, and the commit
+// that marks a durably-acked batch would come back as a rollback. Every message
+// in that batch published twice, because a number could not be read. §13.1 draws
+// this line for the wakeup: "an optimisation, never the delivery path."
+//
+// The observability concern is answered without paying that: the result carries
+// the error, and the pass line says so instead of reporting zeroes.
+func TestPublishPendingBatch_AStatsFailureCannotUndoDelivery(t *testing.T) {
+	f := newPass(t, []PendingMessage{row(1, 0), row(2, 0)}, 100)
+	boom := errors.New("canceling statement due to statement timeout")
+	f.stats.err = boom
+
+	res, err := f.uc.Execute(context.Background())
+	if err != nil {
+		t.Fatalf("Execute = %v; the delivery half of this pass succeeded", err)
+	}
+	if f.uow.commits != 1 {
+		t.Errorf("commits = %d, want 1 — the marks for two acked messages must "+
+			"survive a failure to count rows", f.uow.commits)
+	}
+	if res.Published != 2 {
+		t.Errorf("published = %d, want 2", res.Published)
+	}
+	if !errors.Is(res.StatsErr, boom) {
+		t.Errorf("StatsErr = %v, want the reader's error — the pass line has to be "+
+			"able to say the backlog is unknown rather than report it as zero", res.StatsErr)
+	}
+	if res.Stats != (OutboxStats{}) {
+		t.Errorf("stats = %+v, want the zero value alongside StatsErr", res.Stats)
+	}
+}
+
+// Stats are read after the commit, not inside it. Read inside, they described a
+// state that had not happened yet and might never — a backlog that excluded rows
+// the pass had marked, in a pass that then rolled back.
+func TestPublishPendingBatch_StatsAreReadAfterTheCommit(t *testing.T) {
 	f := newPass(t, []PendingMessage{row(1, 0)}, 100)
-	f.outbox.statsErr = errors.New("stats unavailable")
+	f.uow.beforeCommit = func() {
+		if f.stats.reads != 0 {
+			t.Errorf("the stats read happened inside the transaction (%d reads before "+
+				"commit); it must not be able to abort it", f.stats.reads)
+		}
+	}
+
+	if _, err := f.uc.Execute(context.Background()); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if f.stats.reads != 1 {
+		t.Errorf("stats reads = %d, want 1 after the commit", f.stats.reads)
+	}
+}
+
+// A pass that rolls back must not read stats at all: there is nothing to report
+// and the numbers would describe a table the pass just stopped changing.
+func TestPublishPendingBatch_ARolledBackPassReadsNoStats(t *testing.T) {
+	f := newPass(t, []PendingMessage{row(1, 0)}, 100)
+	f.publisher.errByEventID[row(1, 0).EventID.String()] = errors.New("unclassified")
 
 	if _, err := f.uc.Execute(context.Background()); err == nil {
-		t.Fatal("Execute returned nil; a pass that cannot observe itself has not succeeded")
+		t.Fatal("Execute returned nil on an unclassified error")
 	}
-	if f.uow.commits != 0 {
-		t.Errorf("commits = %d, want 0", f.uow.commits)
+	if f.stats.reads != 0 {
+		t.Errorf("stats reads = %d, want 0 on a pass that rolled back", f.stats.reads)
 	}
 }
 
@@ -396,6 +464,34 @@ func TestPublishPendingBatch_TheBackoffRunsFromTheFailureNotThePassStart(t *test
 	}
 }
 
+// A pass can fail after the broker has durably accepted some of its messages —
+// a mark that fails, a commit that fails, a SIGTERM past the drain. Those rows go
+// back to pending and will be published again, and Published is the only place
+// that count exists. Returning a zeroed result would make the one moment the
+// relay knowingly creates duplicates the one moment it reports nothing.
+func TestPublishPendingBatch_AFailedPassStillReportsWhatItPublished(t *testing.T) {
+	f := newPass(t, []PendingMessage{row(1, 0), row(2, 0), row(3, 0)}, 100)
+	// Rows 1 and 2 are acked; row 3's error is unclassified, which abandons the
+	// pass and rolls both marks back.
+	f.publisher.errByEventID[row(3, 0).EventID.String()] = errors.New("unclassified")
+
+	res, err := f.uc.Execute(context.Background())
+	if err == nil {
+		t.Fatal("Execute returned nil on an unclassified error")
+	}
+	if res.Published != 2 {
+		t.Errorf("published = %d, want 2 — two messages are on the broker and their "+
+			"marks just rolled back; that is the duplicate count and nothing else "+
+			"records it", res.Published)
+	}
+	if res.Claimed != 3 {
+		t.Errorf("claimed = %d, want 3", res.Claimed)
+	}
+	if f.uow.rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1", f.uow.rollbacks)
+	}
+}
+
 // row builds one claimed outbox row. Its event id is derived from its outbox id
 // so that a failing assertion names something a reader can find.
 func row(id int64, attempts int) PendingMessage {
@@ -418,6 +514,7 @@ func row(id int64, attempts int) PendingMessage {
 type passFixture struct {
 	uc        *PublishPendingBatch
 	outbox    *fakeOutbox
+	stats     *fakeStatsReader
 	uow       *fakePublishUOW
 	publisher *fakePublisher
 	schedule  *fakeSchedule
@@ -433,15 +530,16 @@ func newPass(t *testing.T, rows []PendingMessage, batchSize int) *passFixture {
 	publisher := &fakePublisher{errByEventID: map[string]error{}}
 	schedule := &fakeSchedule{delay: 8 * time.Second}
 	clk := &movableClock{now: now}
+	stats := &fakeStatsReader{}
 
-	uc := NewPublishPendingBatch(uow, publisher, Topics{"User": testTopic}, clk,
+	uc := NewPublishPendingBatch(uow, publisher, stats, Topics{"User": testTopic}, clk,
 		PublishPolicy{
 			BatchSize:   batchSize,
 			Schedule:    schedule,
 			MaxAttempts: 10,
 		})
 	return &passFixture{
-		uc: uc, outbox: outbox, uow: uow,
+		uc: uc, outbox: outbox, stats: stats, uow: uow,
 		publisher: publisher, schedule: schedule, clock: clk, now: now,
 	}
 }

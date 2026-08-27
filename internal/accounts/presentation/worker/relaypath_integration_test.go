@@ -69,6 +69,7 @@ func TestRelayPath(t *testing.T) {
 	pass := application.NewPublishPendingBatch(
 		accountspg.NewPublishUnitOfWork(pool),
 		accountskafka.NewPublisher(kafkatest.Producer(t)),
+		accountspg.NewOutboxStatsReader(pool),
 		application.Topics{domain.AggregateTypeUser: topic},
 		clock.System{},
 		application.PublishPolicy{
@@ -206,6 +207,7 @@ func TestRelayPath_AFailedPublishLeavesTheRowForTheNextPass(t *testing.T) {
 	// the row's survival, which a transient failure would show as well.
 	failing := application.NewPublishPendingBatch(
 		accountspg.NewPublishUnitOfWork(pool), publisher,
+		accountspg.NewOutboxStatsReader(pool),
 		application.Topics{}, clock.System{}, policy)
 
 	first, err := failing.Execute(ctx)
@@ -232,6 +234,7 @@ func TestRelayPath_AFailedPublishLeavesTheRowForTheNextPass(t *testing.T) {
 
 	working := application.NewPublishPendingBatch(
 		accountspg.NewPublishUnitOfWork(pool), publisher,
+		accountspg.NewOutboxStatsReader(pool),
 		application.Topics{domain.AggregateTypeUser: topic}, clock.System{}, policy)
 
 	second, err := working.Execute(ctx)

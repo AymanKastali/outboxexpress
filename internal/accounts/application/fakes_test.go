@@ -89,7 +89,7 @@ var errIDs = errors.New("no entropy")
 // out of id order breaks the per-aggregate ordering guarantee of §12.4, and a
 // mark that lands before its ack would be the lost-message bug of §7.
 type outboxCall struct {
-	op          string // "claim", "published", "reschedule", "failed", "stats"
+	op          string // "claim", "published", "reschedule", "failed"
 	id          int64
 	availableAt time.Time
 	lastError   string
@@ -97,15 +97,7 @@ type outboxCall struct {
 
 type fakeOutbox struct {
 	pending []PendingMessage
-	stats   PassStats
-
-	// statsErr is the only injectable failure any test needs: a claim that fails
-	// and a mark that fails are the same branch as far as Execute is concerned
-	// (return the error, roll the pass back), and the stats query is the one that
-	// runs after work has already been done.
-	statsErr error
-
-	calls []outboxCall
+	calls   []outboxCall
 }
 
 func (f *fakeOutbox) ClaimPending(_ context.Context, limit int) ([]PendingMessage, error) {
@@ -132,14 +124,6 @@ func (f *fakeOutbox) MarkFailed(_ context.Context, id int64, lastError string) e
 	return nil
 }
 
-func (f *fakeOutbox) Stats(_ context.Context, _ int) (PassStats, error) {
-	f.calls = append(f.calls, outboxCall{op: "stats"})
-	if f.statsErr != nil {
-		return PassStats{}, f.statsErr
-	}
-	return f.stats, nil
-}
-
 // ops is the call sequence, for asserting on order.
 func (f *fakeOutbox) ops() []string {
 	out := make([]string, 0, len(f.calls))
@@ -161,6 +145,23 @@ func (f *fakeOutbox) callsOf(op string) []outboxCall {
 	return out
 }
 
+// fakeStatsReader is separate from fakeOutbox for the same reason the port is
+// separate from the repository: it is not on the pass's transaction, so a test
+// can fail it without that failure having any way to reach the marks.
+type fakeStatsReader struct {
+	stats OutboxStats
+	err   error
+	reads int
+}
+
+func (f *fakeStatsReader) Read(_ context.Context, _ int) (OutboxStats, error) {
+	f.reads++
+	if f.err != nil {
+		return OutboxStats{}, f.err
+	}
+	return f.stats, nil
+}
+
 // fakePublishUOW commits by returning nil and rolls back by returning fn's
 // error unwrapped — the contract platformpg.WithTx implements, so that a test of
 // the use case and the real transaction agree about what an error means.
@@ -168,12 +169,21 @@ type fakePublishUOW struct {
 	outbox    *fakeOutbox
 	commits   int
 	rollbacks int
+
+	// beforeCommit runs at the moment fn has returned and the transaction is
+	// about to close. It is how a test observes what happened *inside* the
+	// boundary, which is the only way to assert that the stats read is outside
+	// it — a call count taken afterwards cannot tell the two apart.
+	beforeCommit func()
 }
 
 func (f *fakePublishUOW) Do(ctx context.Context, fn func(PublishWork) error) error {
 	if err := fn(PublishWork{Outbox: f.outbox}); err != nil {
 		f.rollbacks++
 		return err
+	}
+	if f.beforeCommit != nil {
+		f.beforeCommit()
 	}
 	f.commits++
 	return nil

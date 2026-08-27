@@ -33,6 +33,7 @@ import (
 type PublishPendingBatch struct {
 	uow       PublishUnitOfWork
 	publisher EventPublisher
+	stats     OutboxStatsReader
 	topics    Topics
 	clock     Clock
 	policy    PublishPolicy
@@ -48,10 +49,12 @@ type PublishPolicy struct {
 }
 
 func NewPublishPendingBatch(uow PublishUnitOfWork, publisher EventPublisher,
-	topics Topics, clk Clock, policy PublishPolicy) *PublishPendingBatch {
+	stats OutboxStatsReader, topics Topics, clk Clock,
+	policy PublishPolicy) *PublishPendingBatch {
 	return &PublishPendingBatch{
 		uow:       uow,
 		publisher: publisher,
+		stats:     stats,
 		topics:    topics,
 		clock:     clk,
 		policy:    policy,
@@ -70,29 +73,53 @@ func (uc *PublishPendingBatch) Execute(ctx context.Context) (PublishResult, erro
 			return err
 		}
 		res.Claimed = len(batch)
-
-		if err := uc.publishBatch(ctx, w.Outbox, batch, &res); err != nil {
-			return err
-		}
-
-		// One stats query, on the transaction the pass already opened, so
-		// observation costs one round trip rather than a background collector
-		// holding its own connection (spec §13.3).
-		stats, err := w.Outbox.Stats(ctx, uc.policy.MaxAttempts)
-		if err != nil {
-			return err
-		}
-		res.Stats = stats
-		return nil
+		return uc.publishBatch(ctx, w.Outbox, batch, &res)
 	})
+
+	// batch_ms is the *transaction's* duration — §13.3 calls it "the signal for
+	// moving to claim-commit-publish", and that signal is about how long a lock
+	// is held. So it is stamped here, before the stats read, and on the failing
+	// path too: a pass that spent thirty seconds and then rolled back is exactly
+	// the one worth timing.
+	res.Duration = uc.clock.Now().Sub(started)
+
 	if err != nil {
-		// A pass that rolled back observed nothing, and saying otherwise would
-		// put counts on a log line for work that did not happen.
-		return PublishResult{}, err
+		// res is returned rather than discarded, and Published is why. Those rows
+		// were durably accepted by the broker and their marks have just rolled
+		// back with everything else, so that number is exactly how many messages
+		// this pass is about to publish for a second time. It is the one figure
+		// worth having from a failed pass and there is nowhere else to get it.
+		return res, err
 	}
 
-	res.Duration = uc.clock.Now().Sub(started)
+	uc.observe(ctx, &res)
 	return res, nil
+}
+
+// observe reads the backlog fields of spec §13.3 — after the pass has committed,
+// and without the power to undo it.
+//
+// A failure is recorded, not returned. By the time this runs the broker has
+// durably accepted every message the pass published and the marks are committed;
+// there is nothing a failure to count rows could justify giving back. §13.1
+// states the rule for the wakeup — "an optimisation, never the delivery path" —
+// and observation is the same rule's other half.
+//
+// It has to be out here to be tolerable at all: PostgreSQL aborts a transaction
+// on any statement error, so swallowing this error *inside* the transaction would
+// only defer it to a commit that returns ErrTxCommitRollback. See
+// OutboxStatsReader for why that is the expensive failure.
+func (uc *PublishPendingBatch) observe(ctx context.Context, res *PublishResult) {
+	stats, err := uc.stats.Read(ctx, uc.policy.MaxAttempts)
+	if err != nil {
+		// Recorded so the pass line can say the numbers are missing. Reporting a
+		// zero backlog instead would be indistinguishable from a healthy idle
+		// relay, which is the one reading an operator must never be handed by
+		// accident.
+		res.StatsErr = err
+		return
+	}
+	res.Stats = stats
 }
 
 // publishBatch publishes and marks each row in turn, stopping early on a
@@ -113,11 +140,16 @@ func (uc *PublishPendingBatch) publishBatch(ctx context.Context, outbox OutboxRe
 
 		switch {
 		case err == nil:
+			// Counted at the ack rather than after the mark, and the difference
+			// only shows on the path that fails. On a pass that commits the two
+			// numbers are identical. On a pass that rolls back this is the honest
+			// one: the broker has the message whether or not the mark survived.
+			res.Published++
+
 			// Only now, after the broker has durably acknowledged it.
 			if err := outbox.MarkPublished(ctx, pending.ID); err != nil {
 				return err
 			}
-			res.Published++
 
 		case errors.Is(err, ErrPermanent):
 			// This message's fault, and waiting will not help. Park it and keep
@@ -228,7 +260,8 @@ func failureOf(pending PendingMessage, err error) Failure {
 	return Failure{OutboxID: pending.ID, EventID: pending.EventID, Reason: err.Error()}
 }
 
-// PublishResult is everything one pass observed.
+// PublishResult is everything one pass observed, on the path that committed and
+// on the path that did not.
 //
 // Every field spec §13.3 asks the relay to log comes from here rather than from
 // a counter incremented in the middle of the loop, which is what makes each one
@@ -238,8 +271,14 @@ type PublishResult struct {
 	Published int
 	Transient []Failure
 	Permanent []Failure
-	Stats     PassStats
 	Duration  time.Duration
+
+	// Stats is the outbox table as it stood just after this pass committed, and
+	// StatsErr is why it is empty when it is. The pass line reports one or the
+	// other: a zero backlog and an unreadable backlog look identical on a
+	// dashboard, and only one of them is good news.
+	Stats    OutboxStats
+	StatsErr error
 
 	// BatchSize is what this pass was asked to claim, stamped by Execute.
 	//

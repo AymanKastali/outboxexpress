@@ -311,7 +311,7 @@ func TestMarkPublished_FailsWhenTheRowIsGone(t *testing.T) {
 }
 
 // The pass line of §13.3, from one query.
-func TestStats_CountTheTableAsThePassSeesIt(t *testing.T) {
+func TestOutboxStatsReader_CountsTheTableOnThePool(t *testing.T) {
 	_, pool := pgtest.Accounts(t)
 	ctx := context.Background()
 
@@ -322,14 +322,11 @@ func TestStats_CountTheTableAsThePassSeesIt(t *testing.T) {
 	seed(t, pool, row{Aggregate: "linus", Status: "failed", Attempts: 1})
 	seed(t, pool, row{Aggregate: "ken", Status: "published"})
 
-	var stats application.PassStats
-	err := NewPublishUnitOfWork(pool).Do(ctx, func(w application.PublishWork) error {
-		var err error
-		stats, err = w.Outbox.Stats(ctx, 10)
-		return err
-	})
+	// On the pool, with no transaction in sight — which is the point of the type
+	// and the reason a failure here can no longer roll back a published batch.
+	stats, err := NewOutboxStatsReader(pool).Read(ctx, 10)
 	if err != nil {
-		t.Fatalf("Do: %v", err)
+		t.Fatalf("Read: %v", err)
 	}
 
 	if stats.Backlog != 3 {
@@ -353,18 +350,13 @@ func TestStats_CountTheTableAsThePassSeesIt(t *testing.T) {
 // An empty table must not report an age of "the epoch". min() over no rows is
 // NULL, and a NULL that scanned as a zero time would produce an
 // oldest_pending_age of fifty-odd years on every idle pass.
-func TestStats_AnEmptyOutboxHasNoOldestRow(t *testing.T) {
+func TestOutboxStatsReader_AnEmptyOutboxHasNoOldestRow(t *testing.T) {
 	_, pool := pgtest.Accounts(t)
 	ctx := context.Background()
 
-	var stats application.PassStats
-	err := NewPublishUnitOfWork(pool).Do(ctx, func(w application.PublishWork) error {
-		var err error
-		stats, err = w.Outbox.Stats(ctx, 10)
-		return err
-	})
+	stats, err := NewOutboxStatsReader(pool).Read(ctx, 10)
 	if err != nil {
-		t.Fatalf("Do: %v", err)
+		t.Fatalf("Read: %v", err)
 	}
 	if stats.Backlog != 0 || stats.OldestPendingAge != 0 {
 		t.Errorf("stats = %+v, want a zeroed backlog and age", stats)

@@ -85,16 +85,14 @@ func (r *Relay) Run(ctx context.Context) error {
 
 		res, err := r.publish.Execute(ctx)
 		if err != nil {
+			r.logFailedPass(res, err)
 			if ctx.Err() != nil {
 				r.log.Info("relay stopped")
 				return nil
 			}
-			// A pass that failed committed nothing, so every row it claimed is
-			// still pending and nothing has been lost. Back off the long way —
-			// retrying at IdleMin against a database that is already unhappy is
-			// how a blip becomes an outage — and try again. The relay is the
-			// thing that must not give up.
-			r.log.Error("relay pass failed", "error", err)
+			// Back off the long way — retrying at IdleMin against a database that
+			// is already unhappy is how a blip becomes an outage — and try again.
+			// The relay is the thing that must not give up.
 			r.wait(ctx, r.policy.IdleMax)
 			continue
 		}
@@ -182,6 +180,25 @@ func (r *Relay) wait(ctx context.Context, d time.Duration) {
 	}
 }
 
+// logFailedPass reports a pass that rolled back.
+//
+// It is logged before the shutdown check in Run, and that ordering is the point:
+// this is the only branch that can leave duplicates behind, and it used to be
+// silent on exactly the path — a signal arriving mid-pass — where it happens most.
+//
+// A rolled-back pass has committed nothing, so every row it claimed is still
+// pending and nothing is lost. But published is not zero: those messages were
+// durably accepted by the broker before the marks were undone, so each one will
+// be published a second time. §11.2 calls that the honest price of D6's lock;
+// this line is where the bill is itemised.
+func (r *Relay) logFailedPass(res application.PublishResult, err error) {
+	r.log.Error("relay pass rolled back; every row it claimed is still pending",
+		"error", err,
+		"claimed", res.Claimed,
+		"republish_on_retry", res.Published,
+		"batch_ms", res.Duration.Milliseconds())
+}
+
 // logPass emits the one line per pass of spec §13.3 — INFO when it did work,
 // DEBUG when it found none, so that an idle relay does not drown the log it will
 // be read from during an incident.
@@ -201,11 +218,23 @@ func (r *Relay) logPass(ctx context.Context, res application.PublishResult) {
 		"published", res.Published,
 		"transient_failures", len(res.Transient),
 		"permanent_failures", len(res.Permanent),
-		"backlog", res.Stats.Backlog,
-		"oldest_pending_age_ms", res.Stats.OldestPendingAge.Milliseconds(),
-		"failed_rows", res.Stats.FailedRows,
-		"stuck_rows", res.Stats.StuckRows,
 		"batch_ms", res.Duration.Milliseconds(),
+	}
+
+	// The backlog fields, or the reason there are none. They are read after the
+	// pass commits and a failure there is tolerated, precisely so that counting
+	// rows can never undo delivery (§13.1, and application.OutboxStatsReader) —
+	// which means this line has to be able to say the counting failed. Zeroes
+	// would be indistinguishable from a healthy idle relay, and that is the one
+	// reading an operator must never be handed by accident.
+	if res.StatsErr != nil {
+		attrs = append(attrs, "stats_error", res.StatsErr.Error())
+	} else {
+		attrs = append(attrs,
+			"backlog", res.Stats.Backlog,
+			"oldest_pending_age_ms", res.Stats.OldestPendingAge.Milliseconds(),
+			"failed_rows", res.Stats.FailedRows,
+			"stuck_rows", res.Stats.StuckRows)
 	}
 
 	// §13.1 wants notify queue usage read every pass and §13.3 wants it on this

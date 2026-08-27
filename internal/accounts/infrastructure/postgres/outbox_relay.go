@@ -29,8 +29,9 @@ import (
 // have nothing to say about it. Three doc comments asserting a rule are worth
 // less than one constructor that cannot express its violation.
 //
-// The purge is a third lifetime — no transaction at all, §13.2 — and gets its own
-// pool-bound type below.
+// The purge and the stats read are the other two lifetimes — no transaction at
+// all — and get their own pool-bound types below. Neither can append and neither
+// can mark, so putting them on the pool costs nothing this type is protecting.
 type RelayOutbox struct {
 	tx pgx.Tx
 }
@@ -170,56 +171,6 @@ func (r *RelayOutbox) markOne(ctx context.Context, sql, what string, id int64, a
 	return nil
 }
 
-func (r *RelayOutbox) Stats(ctx context.Context, maxAttempts int) (application.PassStats, error) {
-	var (
-		stats             application.PassStats
-		oldestPendingAgeS float64
-	)
-	err := r.tx.QueryRow(ctx, outboxStats, maxAttempts).Scan(
-		&stats.Backlog,
-		&oldestPendingAgeS,
-		&stats.FailedRows,
-		&stats.StuckRows,
-	)
-	if err != nil {
-		return application.PassStats{}, fmt.Errorf("postgres: outbox stats: %w", err)
-	}
-	stats.OldestPendingAge = time.Duration(oldestPendingAgeS * float64(time.Second))
-	return stats, nil
-}
-
-// outboxStats is the whole of §13.3's backlog reporting, in one query.
-//
-// One query rather than four, on the transaction the pass has already opened, so
-// that observing the relay costs one round trip. There is no metrics registry and
-// no background collector by design (spec §13.3).
-//
-// Four scalar subqueries rather than four aggregates with FILTER over one scan,
-// and this is the difference between O(backlog) and O(table). A bare
-// `SELECT count(*) FILTER (...) FROM accounts.outbox` has no WHERE clause, so the
-// planner cannot use a partial index for any of the aggregates and must
-// sequentially scan every row the table retains — with OUTBOX_RETENTION at 24h
-// that is every event published in the last day, on every pass, and after a full
-// batch the next pass starts immediately. Giving each aggregate its own predicate
-// lets the pending ones ride outbox_pending_idx and the failed one ride
-// outbox_failed_idx (added in Step 2), both index-only.
-//
-// oldest_pending_age counts from occurred_at of the oldest *pending* row.
-// Published and failed rows must not count, or one long-parked row would make a
-// healthy relay look permanently stuck. coalesce covers the empty table, where
-// min() is NULL — without it an idle relay would report an age of decades.
-const outboxStats = `
-SELECT
-    (SELECT count(*) FROM accounts.outbox
-      WHERE status = 'pending')                                     AS backlog,
-    (SELECT coalesce(extract(epoch FROM now() - min(occurred_at)), 0)
-       FROM accounts.outbox
-      WHERE status = 'pending')                                     AS oldest_pending_age_s,
-    (SELECT count(*) FROM accounts.outbox
-      WHERE status = 'failed')                                      AS failed_rows,
-    (SELECT count(*) FROM accounts.outbox
-      WHERE status = 'pending' AND attempts >= $1)                  AS stuck_rows`
-
 var _ application.OutboxRepository = (*RelayOutbox)(nil)
 
 // purgePublished is the delete of spec §13.2.
@@ -283,3 +234,78 @@ func (r *OutboxPurger) PurgePublished(ctx context.Context, retention time.Durati
 }
 
 var _ application.OutboxPurger = (*OutboxPurger)(nil)
+
+// OutboxStatsReader answers §13.3's backlog fields, on the pool and never on the
+// claiming transaction.
+//
+// That is not a convenience. Inside the transaction a failure here is not
+// tolerable — PostgreSQL aborts a transaction on any statement error, so a
+// statement_timeout on this query would turn the commit that marks a
+// durably-acked batch into an ErrTxCommitRollback, republishing every message in
+// it because a count could not be read. application.OutboxStatsReader argues it
+// at length. This type is the half of that argument the compiler can hold: it has
+// no transaction to abort.
+//
+// It costs one round trip more than sharing the pass's transaction. It does not
+// cost a background collector or a held connection, which is what §13.3's "rather
+// than a background collector holding its own connection" was protecting.
+type OutboxStatsReader struct {
+	pool *pgxpool.Pool
+}
+
+func NewOutboxStatsReader(pool *pgxpool.Pool) *OutboxStatsReader {
+	return &OutboxStatsReader{pool: pool}
+}
+
+// Read reports the table's state, in one query, in its own implicit transaction.
+func (r *OutboxStatsReader) Read(ctx context.Context, maxAttempts int) (application.OutboxStats, error) {
+	var (
+		stats             application.OutboxStats
+		oldestPendingAgeS float64
+	)
+	err := r.pool.QueryRow(ctx, outboxStats, maxAttempts).Scan(
+		&stats.Backlog,
+		&oldestPendingAgeS,
+		&stats.FailedRows,
+		&stats.StuckRows,
+	)
+	if err != nil {
+		return application.OutboxStats{}, fmt.Errorf("postgres: outbox stats: %w", err)
+	}
+	stats.OldestPendingAge = time.Duration(oldestPendingAgeS * float64(time.Second))
+	return stats, nil
+}
+
+// outboxStats is the whole of §13.3's backlog reporting, in one query.
+//
+// One query rather than four, on the transaction the pass has already opened, so
+// that observing the relay costs one round trip. There is no metrics registry and
+// no background collector by design (spec §13.3).
+//
+// Four scalar subqueries rather than four aggregates with FILTER over one scan,
+// and this is the difference between O(backlog) and O(table). A bare
+// `SELECT count(*) FILTER (...) FROM accounts.outbox` has no WHERE clause, so the
+// planner cannot use a partial index for any of the aggregates and must
+// sequentially scan every row the table retains — with OUTBOX_RETENTION at 24h
+// that is every event published in the last day, on every pass, and after a full
+// batch the next pass starts immediately. Giving each aggregate its own predicate
+// lets the pending ones ride outbox_pending_idx and the failed one ride
+// outbox_failed_idx (added in Step 2), both index-only.
+//
+// oldest_pending_age counts from occurred_at of the oldest *pending* row.
+// Published and failed rows must not count, or one long-parked row would make a
+// healthy relay look permanently stuck. coalesce covers the empty table, where
+// min() is NULL — without it an idle relay would report an age of decades.
+const outboxStats = `
+SELECT
+    (SELECT count(*) FROM accounts.outbox
+      WHERE status = 'pending')                                     AS backlog,
+    (SELECT coalesce(extract(epoch FROM now() - min(occurred_at)), 0)
+       FROM accounts.outbox
+      WHERE status = 'pending')                                     AS oldest_pending_age_s,
+    (SELECT count(*) FROM accounts.outbox
+      WHERE status = 'failed')                                      AS failed_rows,
+    (SELECT count(*) FROM accounts.outbox
+      WHERE status = 'pending' AND attempts >= $1)                  AS stuck_rows`
+
+var _ application.OutboxStatsReader = (*OutboxStatsReader)(nil)
