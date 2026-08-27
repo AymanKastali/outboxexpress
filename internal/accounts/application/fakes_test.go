@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/AymanKastali/outboxexpress/internal/accounts/domain"
+	"github.com/AymanKastali/outboxexpress/internal/platform/messaging"
 )
 
 // fakeUOW runs fn immediately and records what happened. It models the two
@@ -68,3 +69,141 @@ func (f fixedIDs) New() (uuid.UUID, error) {
 }
 
 var errIDs = errors.New("no entropy")
+
+// --- the relay's fakes -------------------------------------------------------
+
+// outboxCall records one call so a test can assert on the *sequence* of writes,
+// not just the final state. The order matters here more than usual: publishing
+// out of id order breaks the per-aggregate ordering guarantee of §12.4, and a
+// mark that lands before its ack would be the lost-message bug of §7.
+type outboxCall struct {
+	op          string // "claim", "published", "reschedule", "failed", "stats"
+	id          int64
+	availableAt time.Time
+	lastError   string
+}
+
+type fakeOutbox struct {
+	pending []PendingMessage
+	stats   PassStats
+
+	// statsErr is the only injectable failure any test needs: a claim that fails
+	// and a mark that fails are the same branch as far as Execute is concerned
+	// (return the error, roll the pass back), and the stats query is the one that
+	// runs after work has already been done.
+	statsErr error
+
+	calls []outboxCall
+}
+
+func (f *fakeOutbox) ClaimPending(_ context.Context, limit int) ([]PendingMessage, error) {
+	f.calls = append(f.calls, outboxCall{op: "claim"})
+	if limit < len(f.pending) {
+		return f.pending[:limit], nil
+	}
+	return f.pending, nil
+}
+
+func (f *fakeOutbox) MarkPublished(_ context.Context, id int64) error {
+	f.calls = append(f.calls, outboxCall{op: "published", id: id})
+	return nil
+}
+
+func (f *fakeOutbox) Reschedule(_ context.Context, id int64, availableAt time.Time, lastError string) error {
+	f.calls = append(f.calls, outboxCall{
+		op: "reschedule", id: id, availableAt: availableAt, lastError: lastError})
+	return nil
+}
+
+func (f *fakeOutbox) MarkFailed(_ context.Context, id int64, lastError string) error {
+	f.calls = append(f.calls, outboxCall{op: "failed", id: id, lastError: lastError})
+	return nil
+}
+
+func (f *fakeOutbox) Stats(_ context.Context, _ int) (PassStats, error) {
+	f.calls = append(f.calls, outboxCall{op: "stats"})
+	if f.statsErr != nil {
+		return PassStats{}, f.statsErr
+	}
+	return f.stats, nil
+}
+
+// ops is the call sequence, for asserting on order.
+func (f *fakeOutbox) ops() []string {
+	out := make([]string, 0, len(f.calls))
+	for _, c := range f.calls {
+		out = append(out, c.op)
+	}
+	return out
+}
+
+// callsOf returns every call of one kind, so a test can say "MarkFailed was
+// never called" without scanning.
+func (f *fakeOutbox) callsOf(op string) []outboxCall {
+	var out []outboxCall
+	for _, c := range f.calls {
+		if c.op == op {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// fakePublishUOW commits by returning nil and rolls back by returning fn's
+// error unwrapped — the contract platformpg.WithTx implements, so that a test of
+// the use case and the real transaction agree about what an error means.
+type fakePublishUOW struct {
+	outbox    *fakeOutbox
+	commits   int
+	rollbacks int
+}
+
+func (f *fakePublishUOW) Do(ctx context.Context, fn func(PublishWork) error) error {
+	if err := fn(PublishWork{Outbox: f.outbox}); err != nil {
+		f.rollbacks++
+		return err
+	}
+	f.commits++
+	return nil
+}
+
+// fakeSchedule returns a constant and records what it was asked about.
+//
+// The real arithmetic lives in platform/backoff and is asserted there; a pass
+// test that used it would be re-asserting §12.1 from the wrong layer. What this
+// layer owns is *which* number it passes in — the attempts recorded before this
+// failure — so askedFor is the assertable half.
+type fakeSchedule struct {
+	delay    time.Duration
+	askedFor []int
+}
+
+func (f *fakeSchedule) After(attempts int) time.Duration {
+	f.askedFor = append(f.askedFor, attempts)
+	return f.delay
+}
+
+// fakePublisher answers per topic-and-key so a test can make exactly one row
+// fail. It records what it was asked to publish, which is how the header set of
+// §9.2 is asserted without a broker.
+type fakePublisher struct {
+	errByEventID map[string]error
+	published    []messaging.Message
+}
+
+func (f *fakePublisher) Publish(_ context.Context, msg messaging.Message) error {
+	if err := f.errByEventID[msg.EventID]; err != nil {
+		return err
+	}
+	f.published = append(f.published, msg)
+	return nil
+}
+
+// eventIDs is the publish order, which must be id order.
+func (f *fakePublisher) eventIDs() []string {
+	out := make([]string, 0, len(f.published))
+	for _, m := range f.published {
+		out = append(out, m.EventID)
+	}
+	return out
+}
