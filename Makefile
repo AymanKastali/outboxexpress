@@ -34,3 +34,6 @@ db-logs:
 
 migrate:
 > go run ./cmd/migrate -context all -action up
+
+run-api:
+> go run ./cmd/api
