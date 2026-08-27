@@ -133,10 +133,10 @@ func mapData(event domain.Event) (any, messageSchema, error) {
 func headers(meta Metadata) map[string]string {
 	h := make(map[string]string, 2)
 	if meta.CorrelationID != "" {
-		h["correlation_id"] = meta.CorrelationID
+		h[messaging.HeaderCorrelationID] = meta.CorrelationID
 	}
 	if meta.Traceparent != "" {
-		h["traceparent"] = meta.Traceparent
+		h[messaging.HeaderTraceparent] = meta.Traceparent
 	}
 	return h
 }
