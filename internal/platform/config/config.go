@@ -121,6 +121,13 @@ type Relay struct {
 
 	UseNotify bool
 
+	// DrainGrace is how long a relay pass already in flight may keep running
+	// after SIGTERM. Cancelling it instead rolls back the marks for messages the
+	// broker has already durably accepted, so each one is published again on the
+	// next start — once per pod, per release. It must fit inside the
+	// orchestrator's own termination grace period (Kubernetes defaults to 30s).
+	DrainGrace time.Duration
+
 	PurgeInterval   time.Duration
 	OutboxRetention time.Duration
 	PurgeBatch      int
@@ -129,7 +136,7 @@ type Relay struct {
 // LoadRelay parses the relay's environment.
 //
 // Unlike LoadAPI it collects every problem before returning, because there are
-// fourteen variables here and telling an operator about them one restart at a
+// fifteen variables here and telling an operator about them one restart at a
 // time is a bad trade. LoadAPI keeps its early returns: with two required
 // variables the difference is invisible.
 func LoadRelay(getenv func(string) string) (Relay, error) {
@@ -157,6 +164,8 @@ func LoadRelay(getenv func(string) string) (Relay, error) {
 	fail(err)
 	useNotify, err := parsed(getenv, "RELAY_USE_NOTIFY", true, strconv.ParseBool)
 	fail(err)
+	drainGrace, err := parsed(getenv, "RELAY_DRAIN_GRACE", 15*time.Second, time.ParseDuration)
+	fail(err)
 	purgeInterval, err := parsed(getenv, "PURGE_INTERVAL", time.Minute, time.ParseDuration)
 	fail(err)
 	outboxRetention, err := parsed(getenv, "OUTBOX_RETENTION", 24*time.Hour, time.ParseDuration)
@@ -179,6 +188,7 @@ func LoadRelay(getenv func(string) string) (Relay, error) {
 		BackoffCap:      backoffCap,
 		MaxAttempts:     maxAttempts,
 		UseNotify:       useNotify,
+		DrainGrace:      drainGrace,
 		PurgeInterval:   purgeInterval,
 		OutboxRetention: outboxRetention,
 		PurgeBatch:      purgeBatch,
@@ -194,6 +204,7 @@ func LoadRelay(getenv func(string) string) (Relay, error) {
 	fail(positive("PURGE_BATCH", cfg.PurgeBatch))
 	fail(positive("RELAY_IDLE_MIN", cfg.IdleMin))
 	fail(positive("RELAY_BACKOFF_BASE", cfg.BackoffBase))
+	fail(positive("RELAY_DRAIN_GRACE", cfg.DrainGrace))
 	fail(positive("PURGE_INTERVAL", cfg.PurgeInterval))
 	fail(positive("OUTBOX_RETENTION", cfg.OutboxRetention))
 

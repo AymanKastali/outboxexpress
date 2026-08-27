@@ -124,6 +124,10 @@ func run() error {
 	relayLoop := worker.NewRelay(publishPass, wake, backoff.Factor, log, worker.RelayPolicy{
 		IdleMin: cfg.IdleMin,
 		IdleMax: cfg.IdleMax,
+		// The pass in flight when the signal arrives gets this long to finish and
+		// commit. Cancelling it instead republishes everything it had already
+		// acked — see worker.Relay.draining.
+		DrainGrace: cfg.DrainGrace,
 	})
 	purgeLoop := worker.NewPurger(purgeRun, log, cfg.PurgeInterval)
 
@@ -143,6 +147,10 @@ func run() error {
 		"use_notify", cfg.UseNotify,
 		"expected_schema", expectedSchema)
 
+	// Every defer above — the pool, the Kafka client, the listen connection —
+	// runs after g.Wait returns, which is after the drain. That ordering is what
+	// makes RELAY_DRAIN_GRACE mean anything: a pass finishing its marks needs the
+	// pool still open.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return relayLoop.Run(gctx) })
 	g.Go(func() error { return purgeLoop.Run(gctx) })

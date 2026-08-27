@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -378,6 +379,108 @@ func TestRelay_KeepsGoingAfterAFailedPass(t *testing.T) {
 	}
 }
 
+// The drain, and the reason it exists. A pass in flight when the signal arrives
+// must be allowed to finish, because the marks it has not made yet are for
+// messages the broker already durably has: cancelling it publishes every one of
+// them a second time on the next start, once per pod per release.
+//
+// §11.2 says the crash window cannot be closed, and that is true of a crash. This
+// is the part that is not a crash.
+func TestRelay_ShutdownLetsThePassInFlightFinish(t *testing.T) {
+	var out bytes.Buffer
+	stopped := make(chan struct{})
+
+	// The pass blocks until the process has been asked to stop, then reports
+	// whether its own context survived — which is the whole question.
+	var passCtxLive bool
+	pass := &fakePass{onExecute: func(ctx context.Context) {
+		close(stopped)
+		// Give the signal time to propagate; the pass must still be runnable.
+		time.Sleep(50 * time.Millisecond)
+		passCtxLive = ctx.Err() == nil
+	}}
+	pass.stopAfter = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-stopped
+		cancel() // SIGTERM, arriving mid-pass
+	}()
+
+	if err := newRelay(t, pass, &fakeWaiter{}, &out).Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !passCtxLive {
+		t.Error("the pass was cancelled by the shutdown signal; every mark it had " +
+			"not made yet is a message the broker has and the outbox will send again")
+	}
+	// And the loop still stops, cleanly: the grace is for the pass, not the loop,
+	// and a pass that finished inside it is not worth a warning.
+	if logged := out.String(); !strings.Contains(logged, `"msg":"relay stopped"`) {
+		t.Errorf("the relay did not stop cleanly after draining:\n%s", logged)
+	}
+}
+
+// The grace is a bound, not a promise. A pass that outlasts it is cancelled — the
+// behaviour this loop always had — but it says so now, because the operator whose
+// deploy just produced duplicates deserves to know which of the two happened.
+func TestRelay_APassThatOutlastsTheGraceIsAbandonedLoudly(t *testing.T) {
+	var out bytes.Buffer
+	stopped := make(chan struct{})
+
+	var passCtxErr error
+	pass := &fakePass{onExecute: func(ctx context.Context) {
+		close(stopped)
+		<-ctx.Done() // outlast the grace
+		passCtxErr = ctx.Err()
+	}}
+	pass.stopAfter = 1
+
+	log := slog.New(slog.NewJSONHandler(&out, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	relay := NewRelay(pass, &fakeWaiter{}, func() float64 { return 1 }, log, RelayPolicy{
+		IdleMin:    50 * time.Millisecond,
+		IdleMax:    2 * time.Second,
+		DrainGrace: 20 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-stopped
+		cancel()
+	}()
+
+	if err := relay.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if passCtxErr == nil {
+		t.Error("the pass ran past the grace period and was never cancelled")
+	}
+	if !strings.Contains(out.String(), "drain grace expired") {
+		t.Errorf("an expired grace was not warned about:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `"level":"WARN"`) {
+		t.Error("an expired grace is not a clean stop and must not read as one")
+	}
+}
+
+// A relay that is never asked to stop must not be holding anything waiting for
+// the shutdown it has not had. This is why draining uses context.AfterFunc and
+// returns a stop rather than parking a goroutine on ctx.Done for the lifetime of
+// the process.
+func TestRelay_ADrainLeavesNothingBehindWhenThereIsNoShutdown(t *testing.T) {
+	before := runtime.NumGoroutine()
+	for range 200 {
+		relay := newRelay(t, &fakePass{}, &fakeWaiter{}, &bytes.Buffer{})
+		pass, abandon := relay.draining(context.Background())
+		abandon()
+		<-pass.Done()
+	}
+	// A little slack for the runtime, and none for two hundred parked waiters.
+	if after := runtime.NumGoroutine(); after > before+10 {
+		t.Errorf("goroutines went from %d to %d across 200 drains", before, after)
+	}
+}
+
 // newRelay wires a relay with a jitter factor of 1, so that every expectation in
 // this file is an exact duration rather than a range.
 func newRelay(t *testing.T, pass *fakePass, wake Waiter, out *bytes.Buffer) *Relay {
@@ -386,6 +489,9 @@ func newRelay(t *testing.T, pass *fakePass, wake Waiter, out *bytes.Buffer) *Rel
 	return NewRelay(pass, wake, func() float64 { return 1 }, log, RelayPolicy{
 		IdleMin: 50 * time.Millisecond,
 		IdleMax: 2 * time.Second,
+		// Non-zero, so every test in this file runs the two-context shape the
+		// relay really uses rather than the degenerate one.
+		DrainGrace: time.Second,
 	})
 }
 
@@ -401,14 +507,22 @@ type fakePass struct {
 	stopAfter int
 	calls     int
 	stop      context.CancelFunc
+
+	// onExecute runs inside the pass, with the pass's own context. It is how the
+	// drain tests ask the one question that matters — is this context still
+	// live? — which cannot be observed from outside a call that has returned.
+	onExecute func(context.Context)
 }
 
 // A plain int, not an atomic: Run is called synchronously from the test and every
 // read of calls happens after it returns. An atomic here would tell the next
 // reader this loop is concurrent, which it is not.
-func (f *fakePass) Execute(context.Context) (application.PublishResult, error) {
+func (f *fakePass) Execute(ctx context.Context) (application.PublishResult, error) {
 	f.calls++
 	n := f.calls
+	if f.onExecute != nil {
+		f.onExecute(ctx)
+	}
 	if f.stop != nil && n >= f.stopAfter {
 		defer f.stop()
 	}

@@ -140,6 +140,13 @@ func TestLoadRelay_Defaults(t *testing.T) {
 	if !cfg.UseNotify {
 		t.Error("UseNotify = false, want true by default")
 	}
+	// Comfortably inside Kubernetes' 30s default terminationGracePeriodSeconds,
+	// and enough for one produce at §10.1's 10s request timeout plus its marks.
+	// A zero here would silently restore the behaviour where every restart
+	// republishes whatever the pass in flight had already acked.
+	if cfg.DrainGrace != 15*time.Second {
+		t.Errorf("DrainGrace = %v, want 15s", cfg.DrainGrace)
+	}
 	if cfg.PurgeInterval != time.Minute || cfg.OutboxRetention != 24*time.Hour || cfg.PurgeBatch != 1000 {
 		t.Errorf("purge = %v/%v/%d, want 1m/24h/1000",
 			cfg.PurgeInterval, cfg.OutboxRetention, cfg.PurgeBatch)
@@ -160,6 +167,7 @@ func TestLoadRelay_ReadsEveryVariable(t *testing.T) {
 		"RELAY_BACKOFF_CAP":     "10m",
 		"RELAY_MAX_ATTEMPTS":    "3",
 		"RELAY_USE_NOTIFY":      "false",
+		"RELAY_DRAIN_GRACE":     "8s",
 		"PURGE_INTERVAL":        "30s",
 		"OUTBOX_RETENTION":      "72h",
 		"PURGE_BATCH":           "250",
@@ -183,13 +191,16 @@ func TestLoadRelay_ReadsEveryVariable(t *testing.T) {
 	if cfg.OutboxRetention != 72*time.Hour {
 		t.Errorf("OutboxRetention = %v, want 72h", cfg.OutboxRetention)
 	}
+	if cfg.DrainGrace != 8*time.Second {
+		t.Errorf("DrainGrace = %v, want 8s", cfg.DrainGrace)
+	}
 	if cfg.LogLevel != slog.LevelDebug {
 		t.Errorf("LogLevel = %v, want debug", cfg.LogLevel)
 	}
 }
 
 // A process that starts with invalid configuration fails later and further from
-// the cause. Fourteen variables is enough that reporting them one boot at a time
+// the cause. Fifteen variables is enough that reporting them one boot at a time
 // is a bad trade, so LoadRelay joins them.
 func TestLoadRelay_ReportsEveryProblemAtOnce(t *testing.T) {
 	env := map[string]string{
@@ -200,15 +211,17 @@ func TestLoadRelay_ReportsEveryProblemAtOnce(t *testing.T) {
 		"RELAY_BACKOFF_BASE": "10m",
 		"RELAY_BACKOFF_CAP":  "1s", // below the base
 		"RELAY_MAX_ATTEMPTS": "0",
+		"RELAY_DRAIN_GRACE":  "0s",
 		"PURGE_BATCH":        "-1",
 	}
 	_, err := LoadRelay(func(key string) string { return env[key] })
 	if err == nil {
-		t.Fatal("LoadRelay accepted a configuration with eight problems in it")
+		t.Fatal("LoadRelay accepted a configuration with nine problems in it")
 	}
 	for _, want := range []string{
 		"ACCOUNTS_DATABASE_URL",
 		"RELAY_BATCH_SIZE",
+		"RELAY_DRAIN_GRACE",
 		"RELAY_IDLE_MAX",
 		"RELAY_BACKOFF_CAP",
 		"RELAY_MAX_ATTEMPTS",

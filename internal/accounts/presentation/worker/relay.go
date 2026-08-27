@@ -48,6 +48,16 @@ type Relay struct {
 type RelayPolicy struct {
 	IdleMin time.Duration
 	IdleMax time.Duration
+
+	// DrainGrace is how long a pass already in flight may keep running after the
+	// process has been asked to stop (spec §14, RELAY_DRAIN_GRACE). See draining
+	// for what it buys. It has to fit inside whatever the orchestrator allows
+	// between SIGTERM and SIGKILL, or the kill arrives first and the grace was a
+	// promise nobody kept.
+	//
+	// Zero means no grace, which is the behaviour of a loop that has never heard
+	// of shutdown: the pass is cancelled with everything else.
+	DrainGrace time.Duration
 }
 
 // NewRelay builds the loop.
@@ -75,19 +85,27 @@ func (r *Relay) Run(ctx context.Context) error {
 	r.log.Info("relay started",
 		"idle_min", r.policy.IdleMin,
 		"idle_max", r.policy.IdleMax,
+		"drain_grace", r.policy.DrainGrace,
 		"wakeup", r.wake != nil)
+
+	// Two contexts from here down, and the difference between them is the whole
+	// of graceful shutdown. ctx means stop taking new work; pass means abandon
+	// the work in hand. Every use of one rather than the other below is a
+	// deliberate choice about which of those two things is being asked for.
+	pass, abandon := r.draining(ctx)
+	defer abandon()
 
 	for {
 		if ctx.Err() != nil {
-			r.log.Info("relay stopped")
+			r.stopping(pass)
 			return nil
 		}
 
-		res, err := r.publish.Execute(ctx)
+		res, err := r.publish.Execute(pass)
 		if err != nil {
 			r.logFailedPass(res, err)
 			if ctx.Err() != nil {
-				r.log.Info("relay stopped")
+				r.stopping(pass)
 				return nil
 			}
 			// Back off the long way — retrying at IdleMin against a database that
@@ -97,9 +115,76 @@ func (r *Relay) Run(ctx context.Context) error {
 			continue
 		}
 
-		r.logPass(ctx, res)
+		r.logPass(pass, res)
 		r.wait(ctx, r.nextWait(res))
 	}
+}
+
+// draining returns the context a pass runs under: one that survives ctx by
+// DrainGrace, so that a pass already in flight when the signal arrives gets to
+// finish and commit.
+//
+// This is the difference between a restart and a crash, and the reason it needs
+// saying is that §11.2 says the crash window cannot be closed. That is true of a
+// crash. A SIGTERM is not a crash — it is the most frequent stop there is, once
+// per pod per release — and cancelling the pass mid-ack rolls back every mark it
+// had made, so each message the broker had already durably accepted is published
+// again on the next start. cmd/api makes exactly this argument for draining its
+// listener: "a request that has committed but not yet responded is a request
+// whose client does not know it succeeded." A produce that is acked but not yet
+// marked is that same sentence, about the outbox.
+//
+// It is http.Server's rule applied to a loop instead of a listener: stop
+// accepting, then let what is in flight finish. The loop stops between passes
+// because Run checks ctx at the top and wait returns on it at once; only the pass
+// itself is given the grace.
+//
+// The grace has to cover one produce and the marks around it rather than a whole
+// batch, because the pass in flight is the only one there will be. Past it the
+// pass is cancelled and rolls back — the old behaviour, and stopping says which
+// of the two happened.
+//
+// Nothing here logs, and that is deliberate: the callbacks below run on the
+// runtime's goroutines, and a line written from one of them can outlive Run — the
+// stop returned by AfterFunc reports that the callback has *started*, and offers
+// no way to join it. Keeping every line on Run's own goroutine means Run
+// returning is the end of this relay, with nothing still writing behind it.
+func (r *Relay) draining(ctx context.Context) (context.Context, context.CancelFunc) {
+	// WithoutCancel and then a cancel of our own: the pass must not inherit ctx's
+	// cancellation, only reach it through the grace period below.
+	pass, abandon := context.WithCancel(context.WithoutCancel(ctx))
+
+	// AfterFunc rather than a goroutine parked on a channel. It runs once if ctx
+	// ends, and the stop it returns unregisters it if ctx never does — so a
+	// process that runs for a month is not holding a goroutine against the
+	// shutdown it has not had.
+	stop := context.AfterFunc(ctx, func() {
+		expired := time.AfterFunc(r.policy.DrainGrace, abandon)
+		// The pass finished inside the grace, which is the ordinary case: drop the
+		// timer rather than leave a stopping process holding one.
+		context.AfterFunc(pass, func() { expired.Stop() })
+	})
+
+	return pass, func() {
+		stop()
+		abandon()
+	}
+}
+
+// stopping reports how the relay went down. It is one line rather than none
+// because the two ways differ in whether they left duplicates behind, and the
+// operator reading it is mid-deploy.
+//
+// pass is done only if the grace expired: Run's own cancel has not run yet at
+// either call site.
+func (r *Relay) stopping(pass context.Context) {
+	if pass.Err() != nil {
+		r.log.Warn("relay stopped, but the drain grace expired with a pass still in "+
+			"flight; it rolled back, and whatever it had already published will be "+
+			"published again", "drain_grace", r.policy.DrainGrace)
+		return
+	}
+	r.log.Info("relay stopped")
 }
 
 // nextWait picks the next sleep from the pass's own result (spec §6.3).
