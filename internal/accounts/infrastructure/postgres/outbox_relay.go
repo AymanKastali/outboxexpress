@@ -278,19 +278,40 @@ func (r *OutboxStatsReader) Read(ctx context.Context, maxAttempts int) (applicat
 
 // outboxStats is the whole of §13.3's backlog reporting, in one query.
 //
-// One query rather than four, on the transaction the pass has already opened, so
-// that observing the relay costs one round trip. There is no metrics registry and
-// no background collector by design (spec §13.3).
+// Four scalar subqueries rather than four aggregates with FILTER over one scan.
+// A bare `SELECT count(*) FILTER (...) FROM accounts.outbox` has no WHERE clause,
+// so the planner cannot reach a partial index for any of the aggregates and must
+// scan every row the table retains — with OUTBOX_RETENTION at 24h, every event
+// published in the last day, on every pass. Giving each aggregate its own
+// predicate lets the planner choose per aggregate.
 //
-// Four scalar subqueries rather than four aggregates with FILTER over one scan,
-// and this is the difference between O(backlog) and O(table). A bare
-// `SELECT count(*) FILTER (...) FROM accounts.outbox` has no WHERE clause, so the
-// planner cannot use a partial index for any of the aggregates and must
-// sequentially scan every row the table retains — with OUTBOX_RETENTION at 24h
-// that is every event published in the last day, on every pass, and after a full
-// batch the next pass starts immediately. Giving each aggregate its own predicate
-// lets the pending ones ride outbox_pending_idx and the failed one ride
-// outbox_failed_idx (added in Step 2), both index-only.
+// What it then chooses, measured on PostgreSQL 18.6 and worth writing down
+// because the comment that used to be here claimed more than it delivered:
+//
+//	steady state, 99,905 published / 100 pending
+//	  all three pending aggregates ride outbox_pending_idx           ~13 ms
+//	  failed_rows is an index-only scan of 0 entries                 ~0 ms
+//
+//	outage state, 100,000 pending
+//	  backlog, oldest_pending_age and stuck_rows all sequential-scan  ~37 ms
+//	  failed_rows is still index-only                                ~0 ms
+//
+// The degradation is not a missing index and cannot be fixed by adding one.
+// count(*) over a set is O(set) in PostgreSQL whatever the index; min(occurred_at)
+// cannot be index-only because occurred_at is not in outbox_pending_idx; and
+// stuck_rows tests `attempts >= $1`, where $1 is RELAY_MAX_ATTEMPTS and so cannot
+// be a static index predicate. Widening the index would not help either: the
+// pending rows during an outage are freshly inserted, their visibility map bits
+// are unset, and an index-only scan over them would fetch every heap tuple
+// anyway. A wider index for no gain is worse than an honest comment.
+//
+// It is affordable because it is bounded by the backlog, and a relay with a
+// backlog that large is already hours behind on the publishing itself — the count
+// is never the binding constraint. And because it is no longer on the delivery
+// path: this query runs on OutboxStatsReader's pool connection after the pass has
+// committed, so getting slow, or timing out, costs a log line and not a
+// republished batch. That relationship is the point — the query that degrades
+// under load is exactly the one that must not be able to abort a transaction.
 //
 // oldest_pending_age counts from occurred_at of the oldest *pending* row.
 // Published and failed rows must not count, or one long-parked row would make a
