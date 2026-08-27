@@ -71,7 +71,7 @@ func (uc *PublishPendingBatch) Execute(ctx context.Context) (PublishResult, erro
 		}
 		res.Claimed = len(batch)
 
-		if err := uc.publishBatch(ctx, w.Outbox, batch, started, &res); err != nil {
+		if err := uc.publishBatch(ctx, w.Outbox, batch, &res); err != nil {
 			return err
 		}
 
@@ -107,7 +107,7 @@ func (uc *PublishPendingBatch) Execute(ctx context.Context) (PublishResult, erro
 // loop inside a closure. A returned error means abandon the pass; returning nil
 // after an early stop is what lets the stats query still run.
 func (uc *PublishPendingBatch) publishBatch(ctx context.Context, outbox OutboxRepository,
-	batch []PendingMessage, started time.Time, res *PublishResult) error {
+	batch []PendingMessage, res *PublishResult) error {
 	for _, pending := range batch {
 		err := uc.publish(ctx, pending)
 
@@ -137,8 +137,15 @@ func (uc *PublishPendingBatch) publishBatch(ctx context.Context, outbox OutboxRe
 			// The row stays pending. That it does is D8, and it is why an hour of
 			// Kafka being down costs latency rather than a backlog of dead
 			// letters.
+			// The clock is read here, at the failure, and not once at the top of
+			// the pass. §12.1 is literal about it — "available_at = now() +
+			// backoff(attempts)" — and the two readings differ by however long
+			// the pass has been running. A transient failure is usually a produce
+			// that timed out, so they differ by the whole request timeout: taking
+			// the earlier reading silently subtracts that from every backoff, and
+			// can write an available_at that is already in the past.
 			failure := failureOf(pending, err)
-			availableAt := started.Add(uc.policy.Schedule.After(pending.Attempts))
+			availableAt := uc.clock.Now().Add(uc.policy.Schedule.After(pending.Attempts))
 			if err := outbox.Reschedule(ctx, pending.ID, availableAt, failure.Reason); err != nil {
 				return err
 			}

@@ -352,6 +352,50 @@ func TestPublishPendingBatch_AStatsFailureFailsThePass(t *testing.T) {
 	}
 }
 
+// §12.1 is literal: "available_at = now() + backoff(attempts)". now() is the
+// moment of the failure, not the moment the pass began, and the two differ by
+// however long the pass has been running. A transient publish failure is usually
+// a produce that timed out, so the gap is the whole request timeout — measuring
+// from the pass's start would subtract that from every backoff and can write an
+// available_at that is already in the past by the time it is committed.
+//
+// A fixed clock cannot catch this, which is why the produce here takes time.
+func TestPublishPendingBatch_TheBackoffRunsFromTheFailureNotThePassStart(t *testing.T) {
+	const requestTimeout = 10 * time.Second
+
+	f := newPass(t, []PendingMessage{row(1, 3)}, 100)
+	// What a broker outage looks like from in here: the produce holds for the
+	// request timeout and then fails transiently.
+	f.publisher.takes = func() { f.clock.advance(requestTimeout) }
+	f.publisher.errByEventID[row(1, 3).EventID.String()] =
+		fmt.Errorf("%w: REQUEST_TIMED_OUT", ErrTransient)
+
+	res, err := f.uc.Execute(context.Background())
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	reschedules := f.outbox.callsOf("reschedule")
+	if len(reschedules) != 1 {
+		t.Fatalf("reschedule calls = %d, want 1", len(reschedules))
+	}
+	want := f.now.Add(requestTimeout + 8*time.Second)
+	if got := reschedules[0].availableAt; !got.Equal(want) {
+		t.Errorf("available_at = %v, want %v — the ten seconds the produce spent "+
+			"failing must not be deducted from the backoff", got, want)
+	}
+	// And the row must not come back due immediately, which is what the earlier
+	// reading would have produced: start + 8s is two seconds in the past by now.
+	if !reschedules[0].availableAt.After(f.clock.Now()) {
+		t.Errorf("available_at = %v is not in the future at %v; the row is due again "+
+			"at once and the backoff bought nothing", reschedules[0].availableAt, f.clock.Now())
+	}
+	// batch_ms is the transaction's duration, so it sees those ten seconds too.
+	if res.Duration != requestTimeout {
+		t.Errorf("batch_ms source = %v, want %v", res.Duration, requestTimeout)
+	}
+}
+
 // row builds one claimed outbox row. Its event id is derived from its outbox id
 // so that a failing assertion names something a reader can find.
 func row(id int64, attempts int) PendingMessage {
@@ -377,6 +421,7 @@ type passFixture struct {
 	uow       *fakePublishUOW
 	publisher *fakePublisher
 	schedule  *fakeSchedule
+	clock     *movableClock
 	now       time.Time
 }
 
@@ -387,9 +432,9 @@ func newPass(t *testing.T, rows []PendingMessage, batchSize int) *passFixture {
 	uow := &fakePublishUOW{outbox: outbox}
 	publisher := &fakePublisher{errByEventID: map[string]error{}}
 	schedule := &fakeSchedule{delay: 8 * time.Second}
+	clk := &movableClock{now: now}
 
-	uc := NewPublishPendingBatch(uow, publisher, Topics{"User": testTopic},
-		fixedClock{now: now},
+	uc := NewPublishPendingBatch(uow, publisher, Topics{"User": testTopic}, clk,
 		PublishPolicy{
 			BatchSize:   batchSize,
 			Schedule:    schedule,
@@ -397,6 +442,6 @@ func newPass(t *testing.T, rows []PendingMessage, batchSize int) *passFixture {
 		})
 	return &passFixture{
 		uc: uc, outbox: outbox, uow: uow,
-		publisher: publisher, schedule: schedule, now: now,
+		publisher: publisher, schedule: schedule, clock: clk, now: now,
 	}
 }

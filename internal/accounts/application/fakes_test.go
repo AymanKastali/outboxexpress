@@ -56,6 +56,18 @@ type fixedClock struct{ now time.Time }
 
 func (c fixedClock) Now() time.Time { return c.now }
 
+// movableClock is a clock a test can advance, so that "the pass took ten seconds"
+// is expressible. fixedClock stays for the tests where nothing may move.
+//
+// A pointer receiver, because advancing it has to be visible to the use case
+// holding it — a value receiver would give the use case a copy and the test a
+// silent no-op.
+type movableClock struct{ now time.Time }
+
+func (c *movableClock) Now() time.Time { return c.now }
+
+func (c *movableClock) advance(d time.Duration) { c.now = c.now.Add(d) }
+
 type fixedIDs struct {
 	next uuid.UUID
 	err  error
@@ -189,9 +201,18 @@ func (f *fakeSchedule) After(attempts int) time.Duration {
 type fakePublisher struct {
 	errByEventID map[string]error
 	published    []messaging.Message
+
+	// takes, when set, runs before each answer. It is how a test says "this
+	// produce spent ten seconds before it failed", which is the case that
+	// separates a backoff measured from the failure from one measured from the
+	// start of the pass.
+	takes func()
 }
 
 func (f *fakePublisher) Publish(_ context.Context, msg messaging.Message) error {
+	if f.takes != nil {
+		f.takes()
+	}
 	if err := f.errByEventID[msg.EventID]; err != nil {
 		return err
 	}
