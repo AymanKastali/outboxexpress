@@ -138,7 +138,7 @@ health, replay — and the full test pyramid of §21 including fault injection.
 | D3 | **Database per service**: `oe_accounts`, `oe_notifications` | §4: "Two services sharing one outbox table is two services sharing a database — the coupling the architecture exists to avoid." Two databases in one container make a cross-context join or shared transaction impossible to express. |
 | D4 | **Structural event collection**: a unit of work drains tracked aggregates' events inside the commit | §5: this is "the only way 'every state change emits its event' becomes structural rather than a rule people must remember at each call site", and it puts the outbox insert in the persistence layer where the domain never sees it. Fowler's Unit of Work; Evans' aggregate events. |
 | D5 | **Aggregate repository interfaces in `domain`**; technical ports in `application` | The four layers named in the brief are the Onion/DDD vocabulary, in which a Repository is a domain concept. An outbox is not: no domain expert has heard of one. |
-| D6 | Relay **publishes inside the claiming transaction** | §7's recommended default: rows stay locked while publishing, so a crash duplicates one row rather than a batch. |
+| D6 | Relay **publishes inside the claiming transaction** | §7's recommended default. `FOR UPDATE SKIP LOCKED` holds the claim for exactly as long as the transaction, so committing before the ack releases the only thing stopping a second relay from publishing the row. Staying inside it buys mutual exclusion with no lease to tune and no reaper to write (§11.2). It does *not* shrink the crash window — §11.2 states what it costs. |
 | D7 | **Single active relay**; a second instance is safe but unordered | §8: `SKIP LOCKED` makes concurrency safe, not ordered. Ordering is a stated guarantee here, so the relay scales by hot standby, not by parallelism. |
 | D8 | `attempts` drives backoff; **only a permanent error reaches `failed`** | §7's table forbids burning attempts on transient errors, and warns that treating a broker outage as a per-message failure dead-letters the whole backlog. Its pseudocode contradicts its table; this design follows the table. |
 | D9 | **Consumer-side outbox *and* an idempotency key** for the email | §13: remedy 1 alone loses the side effect if the send fails after the inbox row commits — the inbox then deduplicates the retry away. Remedy 2 makes the intent durable; the key makes the call safe to repeat. The reference's own final diagram shows both. |
@@ -698,6 +698,13 @@ again. This window cannot be closed — closing it would require an atomic commi
 across Kafka and PostgreSQL, which is where §1 started. It is why the pattern is
 at-least-once, why `event_id` must be stable, and why §11.3 is not optional.
 
+Its blast radius is the batch, not the row. The marks are uncommitted until the
+pass commits, so a crash after the fortieth ack of a hundred-row batch
+republishes all forty. That is the honest price of D6's lock — the lease-based
+alternative, marking each row in its own short transaction, would duplicate one —
+and it is why `RELAY_BATCH_SIZE` bounds duplicates per crash and is not only a
+throughput knob.
+
 ### 11.3 Consumption — the consuming transaction
 
 ```go
@@ -1051,7 +1058,7 @@ startup, refusing to start on an invalid value. No configuration library.
 | `HTTP_ADDR` | `:8080` | api |
 | `ADMIN_ADDR` | `127.0.0.1:8081` api · `:8082` relay · `:8083` notifier · `:8084` sender | all |
 | `LOG_LEVEL` | `info` | all |
-| `RELAY_BATCH_SIZE` | `100` | relay, sender |
+| `RELAY_BATCH_SIZE` | `100` | relay, sender — also bounds duplicates per crash (§11.2) |
 | `RELAY_IDLE_MIN` / `RELAY_IDLE_MAX` | `50ms` / `2s` | relay, sender |
 | `RELAY_BACKOFF_BASE` / `RELAY_BACKOFF_CAP` | `1s` / `5m` | relay, sender |
 | `RELAY_MAX_ATTEMPTS` | `10` | relay, sender — an alert threshold, not a transition |
