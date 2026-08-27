@@ -18,6 +18,10 @@ test-integration:
 
 lint:
 > go vet ./...
+# -checks=all turns on the ST* style family too, which vet does not cover: it is
+# what requires every package to carry a package comment. The tool is pinned in
+# go.mod, so this runs the same version everywhere.
+> go tool staticcheck -checks=all ./...
 > test -z "$$(gofmt -l . )" || (gofmt -l . && echo "gofmt: files need formatting" && exit 1)
 
 fmt:
