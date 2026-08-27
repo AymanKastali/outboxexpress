@@ -113,6 +113,16 @@ func CountAccounts(t *testing.T, pool *pgxpool.Pool) (users, outbox int) {
 	return users, outbox
 }
 
+// MustExec runs a statement and fails the test if it errors. It is for putting a
+// table into a known state, where a silent failure would make the assertion that
+// follows meaningless rather than merely wrong.
+func MustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("pgtest: exec %q: %v", sql, err)
+	}
+}
+
 func startInstance() (*tcpostgres.PostgresContainer, error) {
 	ctx := context.Background()
 
