@@ -179,12 +179,12 @@ func (r *Relay) draining(ctx context.Context) (context.Context, context.CancelFu
 // either call site.
 func (r *Relay) stopping(pass context.Context) {
 	if pass.Err() != nil {
-		r.log.Warn("relay stopped, but the drain grace expired with a pass still in "+
+		r.log.Warn("relay loop stopped, but the drain grace expired with a pass still in "+
 			"flight; it rolled back, and whatever it had already published will be "+
 			"published again", "drain_grace", r.policy.DrainGrace)
 		return
 	}
-	r.log.Info("relay stopped")
+	r.log.Info("relay loop stopped")
 }
 
 // nextWait picks the next sleep from the pass's own result (spec §6.3).

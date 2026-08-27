@@ -332,7 +332,7 @@ func TestRelay_StopsCleanlyWhenTheContextEnds(t *testing.T) {
 	if err := newRelay(t, pass, &fakeWaiter{}, &out).Run(ctx); err != nil {
 		t.Errorf("Run = %v, want nil on a clean shutdown", err)
 	}
-	if !strings.Contains(out.String(), "relay stopped") {
+	if !strings.Contains(out.String(), "relay loop stopped") {
 		t.Error("the relay stopped without saying so")
 	}
 }
@@ -416,7 +416,7 @@ func TestRelay_ShutdownLetsThePassInFlightFinish(t *testing.T) {
 	}
 	// And the loop still stops, cleanly: the grace is for the pass, not the loop,
 	// and a pass that finished inside it is not worth a warning.
-	if logged := out.String(); !strings.Contains(logged, `"msg":"relay stopped"`) {
+	if logged := out.String(); !strings.Contains(logged, `"msg":"relay loop stopped"`) {
 		t.Errorf("the relay did not stop cleanly after draining:\n%s", logged)
 	}
 }

@@ -76,7 +76,7 @@ duplicates were created:
 ```json
 {"level":"ERROR","msg":"relay pass rolled back; every row it claimed is still pending",
  "claimed":40,"republish_on_retry":12,"batch_ms":3104}
-{"level":"WARN","msg":"relay stopped, but the drain grace expired with a pass still in flight; ..."}
+{"level":"WARN","msg":"relay loop stopped, but the drain grace expired with a pass still in flight; ..."}
 ```
 
 `republish_on_retry` is how many messages the broker durably has whose marks were
