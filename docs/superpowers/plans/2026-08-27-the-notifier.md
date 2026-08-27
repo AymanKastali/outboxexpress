@@ -17,9 +17,11 @@
 Read these before Task 1. Each is a decision already made and already committed, which this plan honours rather than revisits.
 
 - **`platform/messaging` is the only shared type, and it is already half-built.** `messaging.Message` carries `EventID`, `EventType`, `SchemaVersion`, `Key`, `Payload`, `Headers`, `Topic`. Its doc comment says the consumer-side fields "arrive with the consumer that reads them, in Plan 3". Task 1 is that sentence coming due.
-- **The header names are constants in `platform/messaging`, not string literals.** `HeaderEventID`, `HeaderEventType`, `HeaderSpecVersion`, `HeaderSchemaVersion`, `HeaderContentType`, `HeaderCorrelationID`, `HeaderTraceparent`. The relay writes them; this plan reads them. Two contexts agreeing on a spelling by each holding their own literal is how a contract breaks quietly.
+- **`platform/backoff` was written for this plan.** Its package doc says so: "§12.1's relay ladder and §12.2's consumer ladder are the same arithmetic with a different base… Each context declares its own one-method port over this." `internal/accounts/application/publishing.go` repeats it: the formula lives in platform "so that §12.2's consumer ladder can reuse it rather than hand-write the same overflow-prone doubling a second time." Task 10 declares the port and wires `backoff.Exponential`; it does not compute `50ms · 2^n` anywhere.
+- **The header names are constants in `platform/messaging`, not string literals.** `HeaderEventID`, `HeaderEventType`, `HeaderSpecVersion`, `HeaderSchemaVersion`, `HeaderContentType`, `HeaderCorrelationID`, `HeaderTraceparent`. The relay writes them; this plan reads them. Two contexts agreeing on a spelling by each holding their own literal is how a contract breaks quietly. **The six `dlt_*` names of §12.2 join them there**, for the same reason and one more: §12.3's `replay-dlt` tool is specified with no notifier dependency, so a name held privately in `notifications/infrastructure` would be re-declared by its only other reader.
 - **`platformpg.WithTx` owns begin/rollback/commit and returns `fn`'s error unwrapped**, so domain sentinels survive the trip out. This context's unit of work uses it. Do not write a second one.
 - **`platformpg.Queryer` is the "runs on a transaction or a pool" interface** with `Exec` and `QueryRow` and deliberately no `Query`. The inbox's `ON CONFLICT` needs only `QueryRow`; do not widen the interface.
+- **`internal/platform/kafka` is where franz-go meets the shared transport type.** `internal/accounts/infrastructure/kafka/publisher.go`'s `recordHeaders` says of itself: "Composing which headers exist is not done here — that is message contract and lives in the application layer. This function's entire job is the type change." A conversion whose signature names only `messaging.Message` and `kgo.Record` has no context in it, so both directions belong in platform — and `presentation` may import platform, which it may not do for `infrastructure`.
 - **Each context has its own `pgxpool` and its own `uow.go`** (§16). There is no connection on which a cross-context transaction could be written, and `internal/arch`'s `TestNoProcessWiresBothContexts` already fails any `main` that opens both.
 - **Ports live beside what they are about, not in a file called `ports.go`.** This is `internal/accounts/application/doc.go`'s stated convention as of commit `3055f06`, written down precisely so this plan would inherit the considered layout: the repository port sits beside the type it returns, the envelope factory beside the envelope it produces and its only implementation, a single-consumer port beside its consumer, and `machine.go` holds only the residue that genuinely belongs nowhere (`Clock`, `IDGen`).
 - **The domain's `eventRecorder` is unexported and per-context, by design.** `internal/accounts/domain/recorder.go` says so: "the notifications context is a separate model and gets its own recorder if it needs one. Fifteen duplicated lines cost less than a type two bounded contexts must agree on." Copy it. Do not extract it into a shared kernel, and do not import the accounts one — `internal/arch` forbids it and it would be wrong even if it did not.
@@ -28,7 +30,9 @@ Read these before Task 1. Each is a decision already made and already committed,
 - **The lesson of `ce144d0`: `SIGTERM` is not a crash.** The relay drains the pass in flight for `RELAY_DRAIN_GRACE` because a produce that is acked but not yet marked is a duplicate the next pass will create. The notifier has the identical window — a database commit that has landed but whose offset is not yet committed — and Task 11 drains it for the identical reason. Do not implement the loop as `for { select { case <-ctx.Done(): return } }`.
 - **The lesson of `f6f88ea`: observation is not the delivery path.** Any count-the-table query is pool-bound, read after the commit, and its failure is recorded on the result rather than returned. PostgreSQL aborts a transaction on any statement error, so an observability read inside one can undo a durable commit.
 - **JSONB normalises stored JSON.** It sorts object keys and drops insignificant whitespace, so a payload read back out of `notifications.outbox` is semantically identical to but not byte-identical with what the envelope factory produced. Do not assert byte equality between the two.
-- **`internal/platform/kafkatest` and `internal/platform/pgtest` are the only non-`_test.go` files allowed to contain test-only code**, because a container helper is imported by other packages' tests. `kafkatest` already gives you `Broker(t)`, `Producer(t)`, `Topic(t, partitions)` and `Records(t, topic, want)`. Task 9 adds a consumer-side helper to it and nothing to any other package.
+- **`internal/platform/kafkatest` and `internal/platform/pgtest` are the only non-`_test.go` files allowed to contain test-only code**, because a container helper is imported by other packages' tests. `kafkatest` already gives you `Broker(t)`, `Producer(t)`, `Topic(t, partitions)` and — the one this plan keeps reaching for — `Records(t, topic, want)`, a deadline-bounded read-back that fails with the count it actually saw. Use it for every "assert the record arrived" step, including the dead-letter ones. The only addition this plan makes is a unique group name per test.
+- **`pgtest.Notifications(t)` already truncates all three tables** before it returns, exactly as `pgtest.Accounts(t)` does. No integration test in this plan calls `Truncate` after it; a test that did would teach the next reader that it does not, which is how one gets truncated and two are left dirty.
+- **The id generator is `ids.UUIDv7{}` and the clock is `clock.System{}`.** Two different packages; the plan names both explicitly wherever a test or a `main` needs one.
 - **`internal/arch` already generalises over both contexts.** `TestBoundedContextsDoNotKnowEachOther` and `TestNoProcessWiresBothContexts` loop over `[]string{"accounts", "notifications"}`. They pass today because `internal/notifications` is empty; from Task 2 they are load-bearing. This plan adds no new arch rule and needs none.
 
 ---
@@ -70,7 +74,13 @@ The spec's §11.3 listing is a sketch that illustrates the shape of the consumin
 
 **4. The inbox insert is shown returning `(first bool, err error)`, and that is right, but the sketch's ordering hides a subtlety worth stating.** `INSERT … ON CONFLICT DO NOTHING` reports "no rows" for a duplicate, which is what `first` carries. It must be the *first* statement in the transaction, before any other write, so that a duplicate costs one round trip and touches nothing — and, more importantly, so that the notification insert and the outbox drain are unreachable for a record already processed. Task 7's integration test asserts that a duplicate leaves `notifications.outbox` untouched, because "already processed" that still emits a second send-intent would be a duplicate email with an inbox that thinks it did its job.
 
-A fifth, smaller note: §11.3's table of wrong shapes is worth copying into the use case's doc comment nearly verbatim. It is the clearest statement in the spec of why this transaction is not optional, and it belongs where someone editing the transaction will read it.
+**5. `messaging.Message` does not get an `Attempt` field, though §6.5 lists one.** §6.5 is right that the count is process-local and right that Kafka has no delivery counter. It is wrong that the number belongs on the type both contexts share. Trace the field: the worker would write it, and the worker would read it two lines later — one writer and one reader, in one function, in one context. The dead-letter adapter does not read it; it reads `DeadLetterReason.Deliveries`, which already carries the number to the only other place that wants it. What the field buys is nothing; what it costs is a paragraph on the wire contract explaining that this one member is not part of the wire contract, must never be persisted and must never be published — three prohibitions that a local variable makes unrepresentable. §6.5's own argument against a shared domain model is the argument against it. **This plan adds `Partition` and `Offset`** — those are facts about a fetched record, and the dead-letter headers need them — **and keeps the count as a local in the worker.**
+
+**6. The inbox claim moves from the use case into the unit of work.** §11.3's sketch has the use case call `w.Inbox.Record(...)` as the first statement inside `Do`, and the plan's first draft followed it — which put the design's headline invariant in a call site defended by a comment and a test whose failure mode is silent: with the two writes swapped, every assertion about a duplicate still passes, because a duplicate is still reported as a duplicate. It has just inserted a notification first.
+
+That is precisely the situation D4 exists to refuse, and the plan was arguing both sides of it two paragraphs apart — reproducing accounts' "an invariant that lives in a call site is an invariant someone can forget" for the outbox, and then making an exception for the inbox. So the boundary takes it: `Do(ctx, meta, claim, fn)` issues the `ON CONFLICT DO NOTHING` as the transaction's first statement and, when the row already exists, **never calls `fn` at all**. `Work` holds only the notification repository. "Inbox first" stops being a rule and becomes the only thing the type system permits, the ordering test and its silent failure mode both disappear, and the boundary ends up owning both side-tables symmetrically: the deduplication write before the work, the event drain after it.
+
+A seventh, smaller note: §11.3's table of wrong shapes is worth copying into the use case's doc comment nearly verbatim. It is the clearest statement in the spec of why this transaction is not optional, and it belongs where someone editing the transaction will read it.
 
 ---
 
@@ -93,22 +103,21 @@ internal/notifications/
     doc.go                  package doc + the port-placement convention
     machine.go              Clock, IDGen
     unit_of_work.go         Metadata, metadataFrom, Work, UnitOfWork
-    inbox.go                InboxRepository, beside nothing else — it is its own idea
+    inbox.go                InboxClaim — what the boundary deduplicates on
     envelope.go             Envelope (with IdempotencyKey), EnvelopeFactory, CloudEventFactory
     translate.go            the anti-corruption layer: WelcomeRequest, translate
-    consuming.go            ErrTransient, ErrPermanent, DeadLetterPublisher
+    consuming.go            ErrTransient, ErrPermanent, Schedule, DeadLetterPublisher
     process_user_registered.go   the consuming transaction
     purge_inbox.go          the retention job (§13.2)
   infrastructure/
     postgres/
-      uow.go                this context's transaction boundary + event drain
+      uow.go                the boundary: inbox claim, then fn, then the event drain
       tracker.go            records which aggregates were persisted
       inbox_repo.go         Record: ON CONFLICT DO NOTHING -> first bool
       notification_repo.go  Insert
       outbox_repo.go        Append, including idempotency_key
       inbox_purge.go        the pool-bound delete loop
     kafka/
-      consumer.go           kgo.Record -> messaging.Message
       dlt.go                DeadLetterPublisher: original record + dlt_* headers
   presentation/
     worker/
@@ -120,10 +129,14 @@ cmd/notifier/main.go
 **Modified:**
 
 ```
-internal/platform/messaging/message.go        + Partition, Offset, Attempt (§6.5)
-internal/platform/kafka/config.go             + ConsumerConfig
-internal/platform/kafka/client.go             + NewConsumer
-internal/platform/kafkatest/kafkatest.go      + a records-produced helper for consumer tests
+internal/platform/messaging/message.go        + Partition, Offset (§6.5, minus Attempt)
+                                              + the six dlt_* header names (§12.2)
+                                              + SchemaBase, promoted from two copies
+internal/platform/kafka/client.go             + NewConsumer, + RecordToMessage
+                                              + recordHeaders, moved from accounts
+internal/accounts/infrastructure/kafka/publisher.go   calls the moved recordHeaders
+internal/accounts/application/envelope.go     reads messaging.SchemaBase
+internal/platform/kafkatest/kafkatest.go      + ConsumerGroup(t), a unique group per test
 internal/platform/config/config.go            + LoadNotifier
 deploy/docker-compose.yml                     + the notifier service
 deploy/kafka-init.sh                          + the dead-letter topic
@@ -133,11 +146,13 @@ README.md                                     the consuming half, and what to wa
 docs/superpowers/specs/...-design.md          §11.3's sketch annotated with the four divergences
 ```
 
-Two notes on the layout, both following from the convention `doc.go` records.
+Three notes on the layout, all following from the convention `doc.go` records.
 
-`inbox.go` holds `InboxRepository` alone. It has one method and one consumer, which by the convention argues for declaring it inside `process_user_registered.go` — but it is the mechanism the entire plan exists to demonstrate, and a reader looking for "where is the inbox" should find a file called `inbox.go`. The convention says ports live beside what they are about; what this port is about is the inbox, and it has no other file.
+`inbox.go` holds `InboxClaim` and the argument for the mechanism. The *repository* interface is not here: its only caller is the unit of work, which lives in `infrastructure/postgres`, so it is declared there beside `outboxAppender` — the precedent accounts already set for a port whose consumer is the boundary rather than a use case. What stays in the application layer is the value the use case passes in and the paragraph explaining why the boundary deduplicates before it does anything else.
 
-`consuming.go` holds the two error classes and the dead-letter port together because they are one idea from two directions: `ErrPermanent` is the classification, and `DeadLetterPublisher` is what happens to a record that earns it. Splitting them would put the question and its answer in different files.
+`consuming.go` holds the error classes, the retry schedule and the dead-letter port together because they are one idea from three directions: `ErrTransient` is the classification that earns a retry, `Schedule` is how long to wait, and `DeadLetterPublisher` is what happens when retrying is no longer the answer. Splitting them would put the question and its answers in different files.
+
+There is no `consumer.go` under `infrastructure/kafka`. The record-to-message conversion names only `kgo.Record` and `messaging.Message`, so it has no context in it and belongs in `platform/kafka` — which is also the only way the worker can call it, since `presentation` may not import `infrastructure`.
 
 ---
 
@@ -149,44 +164,38 @@ Two notes on the layout, both following from the convention `doc.go` records.
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `messaging.Message` gains `Partition int32`, `Offset int64`, `Attempt int`. Every later task reads them.
+- Produces: `messaging.Message` gains `Partition int32` and `Offset int64`. It does **not** gain `Attempt`; see divergence 5.
 
-This is the smallest task in the plan and the one with the most misleading size. `Attempt` is a field on the type two bounded contexts share, and it is the only field on it that is not part of the wire contract. That has to be written down where a reader will find it, or someone will one day persist it, publish it, or trust it for correctness.
+The whole task is two fields and one paragraph. The paragraph matters because the paragraph is where a field that does not belong on a shared contract type gets refused.
 
 - [ ] **Step 1: Write the failing test**
 
 Add to `internal/platform/messaging/message_test.go`:
 
 ```go
-// The consumer-side fields exist so a worker can identify a record without
-// keeping a parallel map keyed by something it invented. Partition and Offset are
-// the record's coordinates; Attempt is the worker's own count.
+// The coordinates exist so a worker can identify a record — and so the
+// dead-letter headers of §12.2 can say where it came from — without keeping a
+// parallel map keyed by something it invented.
 func TestMessage_CarriesTheRecordCoordinates(t *testing.T) {
 	msg := Message{
 		EventID:   "0199a4f0-0000-7000-8000-000000000001",
 		Topic:     "accounts.user.v1",
 		Partition: 3,
 		Offset:    4711,
-		Attempt:   2,
 	}
 	if msg.Partition != 3 || msg.Offset != 4711 {
 		t.Errorf("coordinates = %d/%d, want 3/4711", msg.Partition, msg.Offset)
 	}
-	if msg.Attempt != 2 {
-		t.Errorf("Attempt = %d, want 2", msg.Attempt)
-	}
 }
 
-// A produced message has no coordinates. The zero values are what a producer
-// leaves behind, and a consumer must be able to tell them apart from a real
-// partition 0 — which it can, because a record it did not fetch has no Topic
-// either. This test exists to pin the *absence* of a sentinel: there is no
-// -1-means-unset convention here, and nothing should add one.
+// A produced message has no coordinates, and the zero values are not a sentinel:
+// partition 0 offset 0 is a real record. The field that says whether these mean
+// anything is Topic — a message this process did not fetch has none. This test
+// pins the absence of a -1-means-unset convention; nothing should add one.
 func TestMessage_AProducedMessageHasNoCoordinates(t *testing.T) {
 	msg := Message{EventID: "x", Topic: "accounts.user.v1", Payload: []byte("{}")}
-	if msg.Partition != 0 || msg.Offset != 0 || msg.Attempt != 0 {
-		t.Errorf("produced message has coordinates: %d/%d/%d",
-			msg.Partition, msg.Offset, msg.Attempt)
+	if msg.Partition != 0 || msg.Offset != 0 {
+		t.Errorf("produced message has coordinates: %d/%d", msg.Partition, msg.Offset)
 	}
 }
 ```
@@ -198,27 +207,25 @@ Expected: FAIL — `unknown field Partition in struct literal`.
 
 - [ ] **Step 3: Add the fields and rewrite the paragraph that promised them**
 
-In `internal/platform/messaging/message.go`, replace the final paragraph of the `Message` doc comment — the one beginning "The consumer-side fields of §6.5 … arrive with the consumer that reads them, in Plan 3" — with the text below, and add the three fields after `Topic`:
+In `internal/platform/messaging/message.go`, replace the final paragraph of the `Message` doc comment — the one beginning "The consumer-side fields of §6.5 … arrive with the consumer that reads them, in Plan 3" — with the text below, and add the two fields after `Topic`:
 
 ```go
 // Partition and Offset are a fetched record's coordinates. They are set by the
-// consumer adapter and are empty on a produced message, which is not a sentinel
-// convention: partition 0 offset 0 is a real record, and the field that tells you
-// whether these mean anything is Topic — a message the process did not fetch has
-// none.
+// consumer adapter, they are empty on a produced message, and that is not a
+// sentinel convention: partition 0 offset 0 is a real record, and the field that
+// tells you whether these mean anything is Topic — a message the process did not
+// fetch has none.
 //
-// Attempt is process-local, and it is the one field here that is not part of the
-// wire contract. Kafka has no delivery counter: a record carries no "how many
-// times have I been handed out" field and there is nowhere to put one without
-// rewriting the record. The notifier keeps an in-memory count keyed by
-// (topic, partition, offset), and that count resets on a rebalance or a restart.
-//
-// It is therefore a heuristic for "stop retrying this one and dead-letter it",
-// and never a correctness input. The inbox is what makes reprocessing safe. Two
-// consequences follow, and both are the reason this paragraph is long: Attempt
-// must never be persisted, because a number that resets on restart would be a lie
-// in a table; and it must never be published, because it describes this process's
-// history with the record rather than anything about the event (spec §6.5, §12.2).
+// §6.5 also lists an Attempt field, and this type deliberately does not have one.
+// §6.5 is right that Kafka has no delivery counter and right that a retry count is
+// process-local; it is wrong that the number belongs here. Its only writer and its
+// only reader are two lines apart inside one worker in one context, so what the
+// field would buy is nothing, and what it would cost is a paragraph on the wire
+// contract explaining that this one member is not part of the wire contract, must
+// never be persisted, and must never be published. A local variable makes all
+// three unrepresentable. The count travels to the one other place that wants it —
+// the dead-letter headers — as a field on the reason the notifier hands its
+// dead-letter port (§12.2).
 type Message struct {
 	EventID       string
 	EventType     string
@@ -229,25 +236,51 @@ type Message struct {
 	Topic         string
 	Partition     int32
 	Offset        int64
-	Attempt       int
 }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [ ] **Step 4: Add the dead-letter header names and promote `SchemaBase`**
 
-Run: `go test ./internal/platform/messaging/ -v`
-Expected: PASS, all of them. The relay's producer path constructs `Message` with field names, so nothing else changes.
+Both belong in this package for the reason its existing header block states: the producer and the consumer must not each hold their own spelling.
 
-- [ ] **Step 5: Prove nothing else moved**
+```go
+// The dead-letter header names of §12.2. They are here rather than in the
+// notifier's adapter because a DLT record has two readers — the notifier that
+// writes it and §12.3's replay tool, which is specified to have no notifier
+// dependency and would therefore re-declare all six.
+const (
+	HeaderDLTReason          = "dlt_reason"
+	HeaderDLTError           = "dlt_error"
+	HeaderDLTDeliveries      = "dlt_deliveries"
+	HeaderDLTOriginalTopic   = "dlt_original_topic"
+	HeaderDLTOriginalPart    = "dlt_original_partition"
+	HeaderDLTOriginalOffset  = "dlt_original_offset"
+)
+
+// SchemaBase is the namespace of the dataschema URI EncodeCloudEvent formats. It
+// is deployment-wide, like SpecVersion and TimeFormat beside it — two copies in
+// two contexts would drift into two published schema namespaces with nothing
+// failing. What is legitimately per-context is `source`, and that stays there.
+const SchemaBase = "https://schemas.outboxexpress.dev"
+```
+
+Then change `internal/accounts/application/envelope.go` to read `messaging.SchemaBase` instead of its own `schemaBase` constant, keeping its `source` where it is.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `go test ./internal/platform/messaging/ ./internal/accounts/... -v`
+Expected: PASS. Accounts' envelope tests assert the full `dataschema` URI, so a mistake in Step 4 fails there.
+
+- [ ] **Step 6: Prove nothing else moved**
 
 Run: `make lint && go test ./...`
-Expected: green. If a positional `Message{...}` literal exists anywhere it fails here; there should be none.
+Expected: green. A positional `Message{...}` literal anywhere would fail here; there should be none.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add internal/platform/messaging
-git commit -m "feat(messaging): the consumer-side fields, and why one of them is not a contract"
+git add internal/platform/messaging internal/accounts/application
+git commit -m "feat(messaging): the record coordinates, and the one field 6.5 asks for that does not belong here"
 ```
 
 ---
@@ -260,7 +293,9 @@ git commit -m "feat(messaging): the consumer-side fields, and why one of them is
 
 **Interfaces:**
 - Consumes: nothing. This package imports stdlib and `github.com/google/uuid` and nothing else, forever.
-- Produces: `NewRecipient(string) (Recipient, error)`, `Recipient.String() string`; `NewUserRef(uuid.UUID) (UserRef, error)`, `UserRef.ID() uuid.UUID`, `UserRef.String() string`; `NotificationState` with `StatePending`/`StateSent`/`StateFailed`, `ParseState(string) (NotificationState, error)`, `NotificationState.String() string`, `NotificationState.canTransitionTo(NotificationState) bool`; the four sentinels in `errors.go`.
+- Produces: `NewRecipient(string) (Recipient, error)`, `Recipient.String() string`; `NewUserRef(uuid.UUID) (UserRef, error)`, `UserRef.ID() uuid.UUID`; `NotificationState` with `StatePending`/`StateSent`/`StateFailed`, `NotificationState.String() string`, `NotificationState.canTransitionTo(NotificationState) bool`; the sentinels in `errors.go`.
+
+There is no `ParseState`. This plan has no read path — the repository is `Insert`-only (Task 3), nothing scans a `state` column, and a round-trip parser with no caller is a branch whose own test has to concede it is unreachable. It belongs in the commit that adds the sender's claiming query, where a round-trip test has something real to protect. Same for `UserRef.String()`: `insertNotification` passes a `uuid.UUID`, so the "column form" accessor has no column.
 
 Three value objects, and the interesting one is `UserRef`. It is the shape of a bounded-context boundary expressed in the type system: accounts' `User` is a different aggregate in a different context, and the only honest thing this context can hold is its identity. A copy of accounts' user here would be one model with a network in the middle (§11.3).
 
@@ -282,7 +317,6 @@ var (
 	ErrInvalidRecipient = errors.New("notifications: recipient is not a valid address")
 	ErrInvalidUserRef   = errors.New("notifications: user reference must not be the nil UUID")
 	ErrInvalidID        = errors.New("notifications: notification id must not be the nil UUID")
-	ErrUnknownState     = errors.New("notifications: unknown notification state")
 
 	// ErrIllegalTransition is the state machine refusing, and it exists as a
 	// sentinel because the sender needs to tell "this notification was already
@@ -486,9 +520,6 @@ func NewUserRef(id uuid.UUID) (UserRef, error) {
 }
 
 func (u UserRef) ID() uuid.UUID { return u.id }
-
-// String is the column form.
-func (u UserRef) String() string { return u.id.String() }
 ```
 
 Run again: PASS.
@@ -500,35 +531,7 @@ Run again: PASS.
 ```go
 package domain
 
-import (
-	"errors"
-	"testing"
-)
-
-func TestParseState_RoundTripsTheThreeLegalValues(t *testing.T) {
-	for _, want := range []NotificationState{StatePending, StateSent, StateFailed} {
-		got, err := ParseState(want.String())
-		if err != nil {
-			t.Fatalf("ParseState(%q): %v", want, err)
-		}
-		if got != want {
-			t.Errorf("round trip = %v, want %v", got, want)
-		}
-	}
-}
-
-// A row read back from the database goes through ParseState, so an unknown value
-// must be an error rather than a zero value. The CHECK constraint makes this
-// unreachable through this application — and an unreachable branch that returns
-// a valid-looking state is how a migration, a manual UPDATE or a future
-// constraint change becomes a silent bug.
-func TestParseState_RejectsAnythingElse(t *testing.T) {
-	for _, s := range []string{"", "PENDING", "queued", "sent "} {
-		if _, err := ParseState(s); !errors.Is(err, ErrUnknownState) {
-			t.Errorf("ParseState(%q) err = %v, want ErrUnknownState", s, err)
-		}
-	}
-}
+import "testing"
 
 // The state machine, asserted as a table. This is the definition; the database's
 // CHECK constraint is the backstop (spec §8.2).
@@ -555,15 +558,15 @@ func TestNotificationState_LegalTransitions(t *testing.T) {
 
 - [ ] **Step 9: Run it, watch it fail, write `state.go`**
 
-Run: `go test ./internal/notifications/domain/ -run TestParseState -v` → FAIL, `undefined: NotificationState`. Then:
+Run: `go test ./internal/notifications/domain/ -run TestNotificationState -v` → FAIL, `undefined: NotificationState`. Then:
 
 ```go
 package domain
 
-// The three legal states of a notification (spec §8.2). They are a defined type
-// rather than string constants so that a function taking a NotificationState
-// cannot be handed "snet", and so that the transition rules have somewhere to
-// live that is not a call site.
+// The three legal states of a notification (spec §8.2). A defined type rather
+// than string constants, so that a function taking a NotificationState cannot be
+// handed "snet", and so the transition rules have somewhere to live that is not a
+// call site.
 type NotificationState string
 
 const (
@@ -571,21 +574,6 @@ const (
 	StateSent    NotificationState = "sent"
 	StateFailed  NotificationState = "failed"
 )
-
-// ParseState converts a stored value back into the type, refusing anything the
-// domain does not define.
-//
-// It is strict on purpose: no trimming, no case folding. A column that contains
-// "Sent" was not written by this application, and guessing what it meant is how a
-// data problem becomes a behaviour problem.
-func ParseState(s string) (NotificationState, error) {
-	switch state := NotificationState(s); state {
-	case StatePending, StateSent, StateFailed:
-		return state, nil
-	default:
-		return "", ErrUnknownState
-	}
-}
 
 func (s NotificationState) String() string { return string(s) }
 
@@ -597,9 +585,9 @@ func (s NotificationState) String() string { return string(s) }
 // precisely the wrong shape here — the sender calling MarkSent twice means the
 // gateway was called twice for one intent, and the aggregate refusing is how that
 // surfaces instead of being absorbed. Idempotency in this design lives in the
-// inbox and the Idempotency-Key, both of which are checked *before* any work
-// happens; an aggregate that also shrugged at repeats would hide the failure of
-// the mechanisms that are supposed to prevent them.
+// inbox and the Idempotency-Key, both checked *before* any work happens; an
+// aggregate that also shrugged at repeats would hide the failure of the
+// mechanisms that are supposed to prevent them.
 func (s NotificationState) canTransitionTo(to NotificationState) bool {
 	return s == StatePending && (to == StateSent || to == StateFailed)
 }
@@ -629,7 +617,7 @@ git commit -m "feat(notifications): the value objects, and a foreign aggregate t
 
 **Interfaces:**
 - Consumes: Task 2's `Recipient`, `UserRef`, `NotificationState` and the sentinels.
-- Produces: `RequestWelcome(id uuid.UUID, to Recipient, user UserRef, sourceEventID uuid.UUID, now time.Time) (*Notification, error)`; accessors `ID()`, `UserID()`, `Recipient()`, `Kind()`, `State()`, `SourceEventID()`, `CreatedAt()`, `SentAt()`; transitions `MarkSent(at time.Time) error`, `MarkFailed(reason string) error`; `PullEvents() []Event`; the `Event` interface; `WelcomeEmailRequested`; `NotificationRepository`.
+- Produces: `RequestWelcome(id uuid.UUID, to Recipient, user UserRef, sourceEventID uuid.UUID, now time.Time) (*Notification, error)`; accessors `ID()`, `UserID()`, `Recipient()`, `Kind()`, `State()`, `SourceEventID()`, `CreatedAt()`, `SentAt()`; transitions `MarkSent(at time.Time) error`, `MarkFailed() error`; `PullEvents() []Event`; the `Event` interface; `WelcomeEmailRequested`; `NotificationRepository`.
 
 `RequestWelcome` is a request, not a send. The name is the whole design in one verb: this context records that an email *should* be sent and emits an event saying so; the send is a durable intent for another process (§11.3). If this constructor were called `SendWelcome`, every reader would look for the SMTP call and every future maintainer would eventually add one.
 
@@ -862,12 +850,12 @@ func TestNotification_RefusesIllegalTransitions(t *testing.T) {
 	if err := sent.MarkSent(testNow); !errors.Is(err, ErrIllegalTransition) {
 		t.Errorf("second MarkSent err = %v, want ErrIllegalTransition", err)
 	}
-	if err := sent.MarkFailed("gateway 503"); !errors.Is(err, ErrIllegalTransition) {
+	if err := sent.MarkFailed(); !errors.Is(err, ErrIllegalTransition) {
 		t.Errorf("MarkFailed after sent err = %v, want ErrIllegalTransition", err)
 	}
 
 	failed := newRequest(t)
-	if err := failed.MarkFailed("gateway 503"); err != nil {
+	if err := failed.MarkFailed(); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 	if err := failed.MarkSent(testNow); !errors.Is(err, ErrIllegalTransition) {
@@ -880,7 +868,7 @@ func TestNotification_RefusesIllegalTransitions(t *testing.T) {
 // disagrees with itself.
 func TestNotification_ARefusedTransitionLeavesTheAggregateUntouched(t *testing.T) {
 	n := newRequest(t)
-	if err := n.MarkFailed("first"); err != nil {
+	if err := n.MarkFailed(); err != nil {
 		t.Fatalf("MarkFailed: %v", err)
 	}
 	before := n.SentAt()
@@ -1034,15 +1022,15 @@ func (n *Notification) MarkSent(at time.Time) error {
 
 // MarkFailed parks a notification a human has to look at.
 //
-// reason is accepted and deliberately not stored. There is no column for it: the
-// failure detail belongs to the send-intent row, whose last_error the sender
-// writes with the full error text and an attempt count beside it. Storing a copy
-// here would give an incident two accounts of the same event, which diverge the
-// first time one of the two writes fails. The parameter stays because a
-// transition that discards its reason at the call site reads like a bug, and
-// because a future notifications table with a failure_reason column should be a
-// change to this method's body and nothing else.
-func (n *Notification) MarkFailed(reason string) error {
+// It takes no reason, and the absence is deliberate. There is no column for one:
+// the failure detail belongs to the send-intent row, whose last_error the sender
+// writes with the full error text and an attempt count beside it. A copy here
+// would give one incident two accounts of itself, which diverge the first time one
+// of the two writes fails. A parameter that is accepted and dropped would be worse
+// than no parameter — a signature promising a record nothing keeps — and the day a
+// failure_reason column arrives, adding it back is a smaller change than explaining
+// why it was there and unused.
+func (n *Notification) MarkFailed() error {
 	if !n.state.canTransitionTo(StateFailed) {
 		return ErrIllegalTransition
 	}
@@ -1054,7 +1042,7 @@ func (n *Notification) MarkFailed(reason string) error {
 - [ ] **Step 6: Run the tests**
 
 Run: `go test ./internal/notifications/domain/ -v`
-Expected: PASS. `staticcheck` will flag the unused `reason` parameter under `-checks=all`; the doc comment above is the answer, and `_ = reason` is not — if the linter insists, name it `reason` and add `//lint:ignore SA4006` only as a last resort. Prefer keeping the parameter used by writing the reason into the returned error on the *illegal* path: `return fmt.Errorf("%w: cannot fail a %s notification (%s)", ErrIllegalTransition, n.state, reason)`. Do that; it is better than an ignore directive and it makes the log line more useful.
+Expected: PASS, and no `staticcheck` complaint — there is no unused parameter to complain about. Do include the state in the refusal, because "illegal transition" without saying from what is an error a reader has to reproduce: `return fmt.Errorf("%w: cannot send a %s notification", ErrIllegalTransition, n.state)`.
 
 - [ ] **Step 7: Write `repository.go`**
 
@@ -1072,28 +1060,29 @@ import "context"
 // The method is Insert rather than Save, and the difference from accounts'
 // UserRepository.Save is deliberate. Save promises "persist whatever state this
 // aggregate is in", which is the right promise for an aggregate with mutating
-// operations. The consuming transaction only ever creates: a notification's later
-// transitions are written by the sender, in its own transaction, against a row it
-// claimed. A Save here would advertise an update path that this plan does not
-// implement and that the next plan should not implement by accident.
+// operations. The consuming transaction only ever creates.
 //
-// Insert returns ErrDuplicateSource when source_event_id is already present —
-// the UNIQUE constraint of §8.2 translated back into the domain's vocabulary.
+// **This interface is unfinished, and Plan 4 must finish it here rather than
+// around it.** The sender transitions a notification to sent, and §11.4 describes
+// that as setting `notifications.state = 'sent'` — which, taken literally, is a
+// SQL UPDATE that goes around MarkSent and leaves the state machine guarding
+// nothing. That is §8.2's own complaint arriving by the back door: "a bare state
+// string field would leave the rules in three places at once: the CHECK, whatever
+// the sender does before its UPDATE, and the reader's memory." A behaviour-rich
+// aggregate whose only writer bypasses its behaviour is an anemic model with extra
+// steps.
+//
+// So the transition belongs on this interface, added by the plan that needs it:
+//
+//	MarkSent(ctx context.Context, n *Notification) error
+//
+// implemented as a conditional UPDATE ... WHERE id = $1 AND state = 'pending'
+// that returns ErrIllegalTransition on zero rows affected — the same rule as
+// canTransitionTo, enforced where concurrency actually lives. The aggregate method
+// stays the definition; the repository makes it the only way through.
 type NotificationRepository interface {
 	Insert(ctx context.Context, n *Notification) error
 }
-```
-
-Add `ErrDuplicateSource` to `errors.go`:
-
-```go
-	// ErrDuplicateSource is the source_event_id UNIQUE constraint, translated.
-	// Reaching it means the inbox did not stop a duplicate — either a bug or a
-	// purged inbox row (§12.3) — so it is worth its own sentinel rather than
-	// arriving as an opaque pgx error: the application layer treats it as a
-	// duplicate rather than a failure, and logs loudly that the second line of
-	// defence was the one that held.
-	ErrDuplicateSource = errors.New("notifications: a notification for this source event already exists")
 ```
 
 - [ ] **Step 8: Run everything**
@@ -1118,7 +1107,7 @@ git commit -m "feat(notifications): the Notification aggregate, where the state 
 
 **Interfaces:**
 - Consumes: `internal/notifications/domain` (Task 2, 3), `internal/platform/messaging` (Task 1).
-- Produces: `ErrTransient`, `ErrPermanent`, `ErrNotForThisConsumer`; `Clock`, `IDGen`; `WelcomeRequest{Recipient, User, SourceEventID}`; `translate(msg messaging.Message) (WelcomeRequest, error)`.
+- Produces: `ErrTransient`, `ErrPermanent`; `Schedule`; `DeadLetterPublisher`, `DeadLetterReason`; `Clock`, `IDGen`; `WelcomeRequest{Recipient, User, SourceEventID}`; `handles(msg messaging.Message) bool`; `translate(msg messaging.Message) (WelcomeRequest, error)`.
 
 This is the task that earns the plan. Everything else in it is machinery that Plan 2 already demonstrated in the other direction; this file is the half of the pattern accounts does not have.
 
@@ -1215,25 +1204,24 @@ import (
 var (
 	ErrTransient = errors.New("notifications: transient failure")
 	ErrPermanent = errors.New("notifications: permanent failure")
-
-	// ErrNotForThisConsumer is neither, and it is not in the spec: §12.2 has two
-	// classes because it describes a topic with one event type on it.
-	//
-	// A topic is a stream of a context's published language, not a queue for one
-	// consumer, and accounts.user.v1 will carry a second event type the day
-	// accounts grows a second use case. This consumer wants user.registered.
-	// Anything else is not an error at all — dead-lettering it would flood the DLT
-	// on a deployment that has nothing to do with notifications, and retrying it
-	// would stall the partition forever.
-	//
-	// So it is skipped and its offset is committed, and — deliberately — no inbox
-	// row is written. An inbox row is a record that this consumer *processed* an
-	// event; writing one for an event it declined to understand would be a lie
-	// that survives a later deployment, so that the version of the notifier which
-	// finally handles that type would skip every record the old one passed over.
-	// Skipping is idempotent on its own; it needs no help.
-	ErrNotForThisConsumer = errors.New("notifications: event type is not handled by this consumer")
 )
+
+// Schedule is how long to wait before the next in-process attempt (§12.2 rung 1).
+//
+// A one-method port over internal/platform/backoff, declared here for the reason
+// that package's doc gives: "§12.1's relay ladder and §12.2's consumer ladder are
+// the same arithmetic with a different base… Each context declares its own
+// one-method port over this." The formula — min(cap, base·2^n) · random(0.5, 1.5),
+// with the saturate-before-multiply that stops an int64 overflow making a backoff
+// get *shorter* the longer the outage lasts — is not rewritten here or anywhere
+// else.
+//
+// It is a port rather than a duration because §15 forbids sleeps for
+// synchronisation: a test that has to wait 350ms to assert three attempts is a
+// test that eventually fails on a loaded machine.
+type Schedule interface {
+	After(attempts int) time.Duration
+}
 
 // DeadLetterPublisher hands a record that will never succeed to the dead-letter
 // topic, and returns only once the broker has durably acknowledged it (spec
@@ -1433,20 +1421,19 @@ func TestTranslate_AnUnparseableEventIDIsPermanent(t *testing.T) {
 	}
 }
 
-// A different event type on the same topic is neither an error nor work. It must
-// not be dead-lettered: accounts adding a second event type to its own topic is a
-// deployment that has nothing to do with notifications, and a DLT full of records
-// this consumer simply does not want is indistinguishable from a real incident.
-func TestTranslate_AnotherEventTypeIsNotForThisConsumer(t *testing.T) {
+// A different event type on the same topic is neither an error nor work, so it is
+// answered by a predicate rather than by an error. Dead-lettering it would flood
+// the DLT on a deployment that has nothing to do with notifications; retrying it
+// would stall the partition forever. Neither is a failure mode worth a sentinel
+// that gets wrapped and unwrapped three lines apart.
+func TestHandles_AcceptsOnlyTheEventThisConsumerWants(t *testing.T) {
 	msg := validRecord(t, nil)
-	msg.EventType = "com.outboxexpress.accounts.user.deactivated"
-	_, err := translate(msg)
-	if !errors.Is(err, ErrNotForThisConsumer) {
-		t.Fatalf("err = %v, want ErrNotForThisConsumer", err)
+	if !handles(msg) {
+		t.Error("handles rejected user.registered")
 	}
-	// And explicitly not the other two, because the worker branches on all three.
-	if errors.Is(err, ErrPermanent) || errors.Is(err, ErrTransient) {
-		t.Errorf("err = %v; an unhandled type is not a failure of any kind", err)
+	msg.EventType = "com.outboxexpress.accounts.user.deactivated"
+	if handles(msg) {
+		t.Error("handles accepted an event type this consumer does not map")
 	}
 }
 
@@ -1497,6 +1484,24 @@ import (
 // §11.3).
 const eventTypeUserRegistered = "com.outboxexpress.accounts.user.registered"
 
+// handles reports whether this consumer maps the record's event type.
+//
+// A predicate, not an error class. A topic is a stream of a context's published
+// language, not a queue for one consumer, so accounts.user.v1 will carry a second
+// event type the day accounts grows a second use case — and a record this consumer
+// does not want is not a failure of any kind. Making it one would put "not for me"
+// into the same vocabulary as "the database is down", where the worker's
+// classification switch would have to grow an arm to stop it being retried forever.
+//
+// A record this returns false for is skipped, its offset is committed, and —
+// deliberately — no inbox row is written. An inbox row records that this consumer
+// *processed* an event; writing one for an event it declined to understand would be
+// a lie that outlives the deployment, hiding every such record from the version of
+// the notifier that finally handles the type. Skipping is idempotent on its own.
+func handles(msg messaging.Message) bool {
+	return msg.EventType == eventTypeUserRegistered
+}
+
 // WelcomeRequest is what the translator returns: this context's own types, ready
 // for its own constructor. Nothing downstream of here has seen accounts' field
 // names, and that is the property the anti-corruption layer exists to provide.
@@ -1521,16 +1526,12 @@ type WelcomeRequest struct {
 // layer that other packages can call is a translation nobody controls, and the
 // only legitimate caller is the use case in this package.
 //
-// Every failure here is ErrPermanent, with one exception. A record on this topic
-// is immutable — retrying a malformed one is a way of never noticing it, which is
-// why §11.3 sends it to the dead-letter topic rather than into a retry loop. The
-// exception is an event type this consumer does not handle, which is not a failure
-// at all; see ErrNotForThisConsumer.
+// Every failure here is ErrPermanent, with no exceptions. A record on this topic
+// is immutable, so retrying a malformed one is a way of never noticing it, which
+// is why §11.3 sends it to the dead-letter topic rather than into a retry loop.
+// Callers establish that the record is one this consumer maps by calling handles
+// first; translate assumes it.
 func translate(msg messaging.Message) (WelcomeRequest, error) {
-	if msg.EventType != eventTypeUserRegistered {
-		return WelcomeRequest{}, fmt.Errorf("%w: %q", ErrNotForThisConsumer, msg.EventType)
-	}
-
 	// The source event id is read first, because it is the only field whose
 	// absence makes the record unprocessable rather than merely invalid: without
 	// it there is no inbox key, so there is no safe way to do the work at all.
@@ -1596,40 +1597,40 @@ type userRegisteredEnvelope struct {
 Run: `go test ./internal/notifications/application/ -run TestTranslate -v`
 Expected: PASS, all of them. If "data is not an object" fails, the reason is that `json.Unmarshal` into a struct field errors on a type mismatch, which is the behaviour the test wants — confirm the error wraps `ErrPermanent`.
 
-- [ ] **Step 8: Assert the boundary with a grep, and make it a test**
+- [ ] **Step 8: Assert the part of the boundary a test can actually express**
 
-Add to `translate_test.go`:
+The property the file exists for is "accounts' vocabulary appears here and nowhere else in the context". A text search over the context's `.go` files cannot express it, and the first draft of this plan found that out the hard way: `envelope.go` legitimately publishes a `user_id` field of *this* context's own schema, so the forbidden list had to be narrowed until it was two strings, permitting `email`, `version`, `subject` and most of the rest of accounts' envelope. A test that cannot tell the two cases apart is worse than no test, because it reads like the boundary is guarded.
+
+So assert the one string that is unambiguously accounts' and cannot occur innocently — its reverse-DNS event type — and say plainly in the comment that this is a tripwire, not a proof.
 
 ```go
-// The anti-corruption layer is only a boundary if it is the *only* boundary. This
-// asserts the property the whole file exists for: accounts' vocabulary appears in
-// translate.go and nowhere else in the context.
+// A tripwire, not a proof. The property this file exists for — that accounts'
+// vocabulary lives here and nowhere else — is not expressible as a text search:
+// envelope.go publishes a user_id field of this context's own schema, and no list
+// of forbidden strings can tell that apart from accounts'. What *is* unambiguous is
+// accounts' reverse-DNS event type namespace: nothing in this context has an
+// innocent reason to name it, and a second file that did would be a second place
+// deciding what an accounts event means.
 //
-// A grep in a test is unusual and this one earns it. The alternative is a comment
-// asking future readers not to reach past the translator, and the entire argument
-// of §11.3 is that a rule living in a call site is a rule someone forgets.
-func TestTranslate_IsTheOnlyPlaceThatKnowsAccountsVocabulary(t *testing.T) {
-	const root = "../.." // internal/
-	forbidden := []string{"user_id", "display_name", "com.outboxexpress.accounts"}
-
-	err := filepath.WalkDir(filepath.Join(root, "notifications"), func(path string, d fs.DirEntry, err error) error {
+// The rest of the property is held by the file's doc comment and by review. That
+// is an honest answer; a green test that permits most of what it claims to forbid
+// is not.
+func TestTranslate_IsTheOnlyPlaceThatNamesAccountsEventTypes(t *testing.T) {
+	err := filepath.WalkDir("..", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || filepath.Ext(path) != ".go" {
 			return err
 		}
-		base := filepath.Base(path)
-		// translate.go owns this vocabulary; its test necessarily contains a
-		// sample of accounts' wire format.
-		if base == "translate.go" || base == "translate_test.go" {
-			return nil
+		switch filepath.Base(path) {
+		case "translate.go", "translate_test.go":
+			return nil // this file owns the vocabulary; its test carries a sample
 		}
 		body, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		for _, word := range forbidden {
-			if bytes.Contains(body, []byte(word)) {
-				t.Errorf("%s contains %q; accounts' vocabulary belongs in translate.go alone", path, word)
-			}
+		if bytes.Contains(body, []byte("com.outboxexpress.accounts")) {
+			t.Errorf("%s names an accounts event type; translate.go is the only "+
+				"place in this context that may", path)
 		}
 		return nil
 	})
@@ -1639,8 +1640,7 @@ func TestTranslate_IsTheOnlyPlaceThatKnowsAccountsVocabulary(t *testing.T) {
 }
 ```
 
-Run: `go test ./internal/notifications/application/ -run TestTranslate_IsTheOnly -v`
-Expected: PASS.
+The walk root is `".."` — the context's `application` directory's parent — so it covers domain, application, infrastructure and presentation as they arrive. Run it after every later task, not just this one.
 
 - [ ] **Step 9: Verify the dependency rule**
 
@@ -1886,13 +1886,12 @@ import (
 	"github.com/AymanKastali/outboxexpress/internal/platform/messaging"
 )
 
-const (
-	// This context's identity on the wire. Constants rather than constructor
-	// parameters: there is one notifications service and no configuration path
-	// sets either value.
-	source     = "/services/notifications"
-	schemaBase = "https://schemas.outboxexpress.dev"
-)
+// This context's identity on the wire. A constant rather than a constructor
+// parameter: there is one notifications service and no configuration path sets it.
+// The schema *base* is not here — it is deployment-wide and lives in
+// platform/messaging as SchemaBase, because two copies would drift into two
+// published schema namespaces with nothing failing.
+const source = "/services/notifications"
 
 var ErrUnmappedEvent = errors.New("notifications: no message mapping for event type")
 
@@ -1955,7 +1954,7 @@ func (f CloudEventFactory) From(events []domain.Event, meta Metadata) ([]Envelop
 
 	envelopes := make([]Envelope, 0, len(events))
 	for _, event := range events {
-		data, schema, key, err := mapData(event)
+		m, err := mapData(event)
 		if err != nil {
 			return nil, err
 		}
@@ -1979,11 +1978,11 @@ func (f CloudEventFactory) From(events []domain.Event, meta Metadata) ([]Envelop
 			Source:      source,
 			Subject:     aggregateID,
 			Time:        occurred,
-			SchemaName:  schema.name,
-			SchemaBase:  schemaBase,
-			Version:     schema.version,
+			SchemaName:  m.schema.name,
+			SchemaBase:  messaging.SchemaBase,
+			Version:     m.schema.version,
 			Traceparent: meta.Traceparent,
-		}, data)
+		}, m.data)
 		if err != nil {
 			return nil, err
 		}
@@ -1993,11 +1992,11 @@ func (f CloudEventFactory) From(events []domain.Event, meta Metadata) ([]Envelop
 			AggregateType:  event.AggregateType(),
 			AggregateID:    aggregateID,
 			EventType:      eventType,
-			SchemaVersion:  schema.version,
+			SchemaVersion:  m.schema.version,
 			Payload:        payload,
 			Headers:        h,
 			OccurredAt:     occurred,
-			IdempotencyKey: key,
+			IdempotencyKey: m.idempotencyKey,
 		})
 	}
 	return envelopes, nil
@@ -2010,27 +2009,39 @@ type messageSchema struct {
 	version int
 }
 
-// mapData is the context-specific part of the envelope: which domain event
-// becomes which data shape, which schema describes it, and — unique to this
-// context — what the idempotency key for the resulting external call is.
-//
-// The key is returned here rather than derived by the caller because it is a
-// per-event-type decision. WelcomeEmailRequested's key is the source event id;
-// a future event whose external effect is keyed differently would say so here,
-// beside its own payload mapping, instead of in a switch somewhere else.
-func mapData(event domain.Event) (any, messageSchema, string, error) {
+// mapping is everything mapData decides about one event: the data shape, the
+// schema that describes it, and the idempotency key for the external call it will
+// cause. One value rather than a widening tuple, for the reason messageSchema
+// exists at all — a per-event-type decision should be one thing a reader can hold,
+// and the alternative is a return list that grows by one every time this context
+// learns to publish something new.
+type mapping struct {
+	data           any
+	schema         messageSchema
+	idempotencyKey string
+}
+
+// mapData is the context-specific part of the envelope. The idempotency key is
+// decided here rather than by the caller because it is a per-event-type question:
+// WelcomeEmailRequested's key is the source event id, and a future event whose
+// external effect is keyed differently says so beside its own payload mapping
+// instead of in a switch somewhere else.
+func mapData(event domain.Event) (mapping, error) {
 	switch e := event.(type) {
 	case domain.WelcomeEmailRequested:
-		return welcomeEmailRequestedData{
-			NotificationID: e.NotificationID.String(),
-			UserID:         e.UserID.String(),
-			Recipient:      e.Recipient.String(),
-			SourceEventID:  e.SourceEventID.String(),
-			RequestedAt:    e.RequestedAt.UTC().Format(messaging.TimeFormat),
-		}, messageSchema{name: "notifications/welcome_email.requested", version: 1},
-			e.SourceEventID.String(), nil
+		return mapping{
+			data: welcomeEmailRequestedData{
+				NotificationID: e.NotificationID.String(),
+				UserID:         e.UserID.String(),
+				Recipient:      e.Recipient.String(),
+				SourceEventID:  e.SourceEventID.String(),
+				RequestedAt:    e.RequestedAt.UTC().Format(messaging.TimeFormat),
+			},
+			schema:         messageSchema{name: "notifications/welcome_email.requested", version: 1},
+			idempotencyKey: e.SourceEventID.String(),
+		}, nil
 	default:
-		return nil, messageSchema{}, "", fmt.Errorf("%w: %s", ErrUnmappedEvent, event.EventType())
+		return mapping{}, fmt.Errorf("%w: %s", ErrUnmappedEvent, event.EventType())
 	}
 }
 
@@ -2063,7 +2074,7 @@ type welcomeEmailRequestedData struct {
 var _ EnvelopeFactory = (*CloudEventFactory)(nil)
 ```
 
-Note: `user_id` appears in this file, which Task 4's grep test forbids outside `translate.go`. It is *this context's* `user_id` in *this context's* published schema, which is a genuine coincidence of naming and not a leak of accounts' vocabulary — but the test cannot tell the difference, and a test that cannot tell the difference is worse than no test. Resolve it by narrowing the forbidden list to `com.outboxexpress.accounts` and `display_name` — the two strings that are unambiguously accounts' — and by adding `envelope.go` nowhere: the assertion must stay a whole-context walk with a single exemption, or it stops being an assertion. Update Task 4's test when you reach this step, and note in its comment why `user_id` had to come off the list.
+Note: `user_id` appears in this file, and it is *this context's* `user_id` in *this context's* published schema — not a leak of accounts' vocabulary. This is the naming coincidence that decided the shape of Task 4's Step 8: a forbidden-strings test cannot tell the two apart, so it asserts only accounts' reverse-DNS namespace, which nothing here has an innocent reason to name. Nothing to do at this step beyond not being surprised.
 
 - [ ] **Step 4: Run it and watch it pass**
 
@@ -2087,9 +2098,11 @@ git commit -m "feat(notifications): the send-intent envelope, and the one column
 
 **Interfaces:**
 - Consumes: Tasks 2–5.
-- Produces: `Metadata`, `metadataFrom(map[string]string) Metadata`, `Work{Notifications domain.NotificationRepository, Inbox InboxRepository}`, `UnitOfWork`; `InboxRepository.Record(ctx, consumer, eventID uuid.UUID, eventType string) (first bool, err error)`; `ProcessResult{Recorded, Duplicate, Ignored bool, NotificationID uuid.UUID}`; `NewProcessUserRegistered(uow, ids, clk, consumer string) *ProcessUserRegistered` and its `Execute(ctx, msg messaging.Message) (ProcessResult, error)`.
+- Produces: `Metadata`, `metadataFrom(map[string]string) Metadata`, `Work{Notifications domain.NotificationRepository}`, `InboxClaim{Consumer, EventID, EventType}`, `UnitOfWork.Do(ctx, meta, claim, fn) (claimed bool, err error)`; `Outcome` with `OutcomeRecorded`/`OutcomeDuplicate`/`OutcomeIgnored`; `ProcessResult{Outcome, NotificationID}`; `NewProcessUserRegistered(uow, ids, clk, consumer string) *ProcessUserRegistered` and its `Execute(ctx, msg messaging.Message) (ProcessResult, error)`.
 
 The use case is short and every line of it is load-bearing. §11.3's table of wrong shapes goes in its doc comment.
+
+Read divergence 6 before starting: the inbox claim is the boundary's first statement, not the use case's. That is the one place this plan departs from §11.3's sketch structurally rather than cosmetically, and the reason is the plan's own D4 argument — an invariant in a call site is an invariant someone forgets, and "inbox first" is exactly that kind of invariant.
 
 - [ ] **Step 1: Write `unit_of_work.go`**
 
@@ -2098,6 +2111,8 @@ package application
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 
 	"github.com/AymanKastali/outboxexpress/internal/notifications/domain"
 	"github.com/AymanKastali/outboxexpress/internal/platform/messaging"
@@ -2134,29 +2149,52 @@ func metadataFrom(headers map[string]string) Metadata {
 // constructs it; a use case can only reach persistence through it, which is what
 // makes an untransacted write unexpressible.
 //
-// Do not add an outbox to this struct — the same prohibition accounts' Work
-// carries, for the same reason. The send-intent row is drained structurally by the
-// unit of work because the aggregate recorded an event; the moment a use case can
-// append one by hand, "every state change emits its event" becomes a rule someone
-// has to remember, with no failing test to notice.
-//
-// The inbox *is* here, and the difference is worth stating. An inbox row is not an
-// event and is not drained from anything: it is a write the use case makes
-// deliberately, first, as the thing that decides whether any other write happens.
-// It has to be reachable for exactly the reason the outbox must not be.
+// It holds one repository, and the two tables it does *not* hold are the point.
+// The outbox is absent for the reason accounts' Work states: the moment a use case
+// can append a send-intent by hand, "every state change emits its event" becomes a
+// rule someone has to remember. The inbox is absent for the same reason one step
+// earlier — see UnitOfWork.Do.
 type Work struct {
 	Notifications domain.NotificationRepository
-	Inbox         InboxRepository
 }
 
-// UnitOfWork is this context's transaction boundary, over this context's own pool.
-// Everything fn does commits together or not at all — including the send-intent
-// row in notifications.outbox, which fn never mentions (§5, §6.4, §11.3).
+// InboxClaim is what the boundary deduplicates on: this consumer's name and the
+// inbound event's identity (§8.2, §12 mechanism 3).
 //
-// It takes Metadata for the same reason accounts' does: the envelope factory needs
-// the trace, and the only place that knows it is the caller.
+// It is a value rather than three parameters because it travels as a unit and
+// because a claim is a thing a reader can name. EventType is carried for the
+// column, not for the key — the key is (consumer, event_id).
+type InboxClaim struct {
+	Consumer  string
+	EventID   uuid.UUID
+	EventType string
+}
+
+// UnitOfWork is this context's transaction boundary, over this context's own pool,
+// and it owns the deduplication decision.
+//
+// Do opens a transaction, records the claim as its **first** statement, and calls
+// fn only if the claim was new. It returns claimed=false for a record this consumer
+// has already processed — having committed, because the transaction did real work
+// (it tried the insert) and because rolling back would leave the offset uncommitted
+// and the record redelivered forever.
+//
+// Everything fn does commits together with the claim and with the send-intent row
+// in notifications.outbox, which fn never mentions (§5, §6.4, §11.3).
+//
+// The claim is a parameter rather than something fn does, and that is this plan's
+// one structural departure from §11.3's sketch. The sketch has the use case call
+// w.Inbox.Record(...) first, which makes "first" a property of a call site — and
+// the plan's own §5/D4 argument is that an invariant living in a call site is an
+// invariant someone forgets. With the two writes swapped, every assertion about a
+// duplicate still passes; it has just inserted a notification first. Here there is
+// nothing to swap: fn cannot run before the claim, and a duplicate cannot reach the
+// notification insert or the event drain, because fn is not called at all. The
+// boundary ends up owning both side-tables symmetrically — the deduplication write
+// before the work, the event drain after it — which is what §11.3's "one
+// transaction, three writes" describes, with the use case asking for one.
 type UnitOfWork interface {
-	Do(ctx context.Context, meta Metadata, fn func(Work) error) error
+	Do(ctx context.Context, meta Metadata, claim InboxClaim, fn func(Work) error) (claimed bool, err error)
 }
 ```
 
@@ -2165,40 +2203,38 @@ type UnitOfWork interface {
 ```go
 package application
 
-import (
-	"context"
-
-	"github.com/google/uuid"
-)
-
-// InboxRepository is the idempotent consumer's memory (spec §12 mechanism 3,
-// §11.3). It is an application port and not a domain repository, for the reason
-// D5 gives: an inbox is not a domain concept. No notifications expert has an
-// opinion about it; it exists because the transport delivers at least once.
+// The inbox is the idempotent consumer's memory (spec §12 mechanism 3, §11.3), and
+// this file exists to hold the argument rather than a type.
 //
-// Record inserts and reports whether this consumer had seen the event before.
-// first is true when the row was new — when this call is the one that claimed the
-// work.
+// There is no InboxRepository interface here. Its only caller is the transaction
+// boundary, which lives in infrastructure/postgres, so the port is declared there
+// beside outboxAppender — the precedent accounts set for a port whose consumer is
+// the boundary rather than a use case. A port exported from the application layer
+// that nothing in the application layer calls is an invitation to call it, and the
+// whole design of Do is that nobody may.
 //
-// Three things about that signature are deliberate.
+// What the mechanism is, for a reader who found this file looking for it:
 //
-// It reports rather than errors, because a duplicate is not a failure. §13.3: "a
-// non-zero duplicate count is healthy, not an error." An error return would put
-// the normal operation of an at-least-once transport on the same path as a broken
-// database.
+// INSERT ... ON CONFLICT DO NOTHING reports one row affected when the event is new
+// and zero when this consumer has seen it before. One round trip, atomic, and
+// correct under concurrency — which a SELECT followed by an INSERT is not, and the
+// difference shows up exactly during a consumer-group rebalance, when two members
+// can briefly be processing the same record (§12).
 //
-// It takes consumer, because several logical consumers may share this database and
-// each must process an event independently (§8.2). This design has one; the
-// parameter is what makes a second one a wiring change rather than a migration.
+// A duplicate is not a failure. §13.3: "a non-zero duplicate count is healthy, not
+// an error." That is why Do reports it as a bool rather than an error, and why the
+// worker logs it at INFO: putting the normal operation of an at-least-once
+// transport on the same path as a broken database trains a reader to ignore both.
 //
-// And it must be called *first* in the transaction, before any other write. That
-// ordering is the mechanism, not a preference: a duplicate then costs one round
-// trip and touches nothing, and — the part that matters — the notification insert
-// and the outbox drain are unreachable for a record already processed. An inbox
-// checked after the work is an inbox that has already let the work happen twice.
-type InboxRepository interface {
-	Record(ctx context.Context, consumer string, eventID uuid.UUID, eventType string) (first bool, err error)
-}
+// The consumer name is part of the key because several logical consumers may share
+// this database and each must process an event independently (§8.2). This design
+// has one; the parameter is what makes a second one a wiring change rather than a
+// migration.
+//
+// A duplicate still costs three round trips, not one: BEGIN, the conflicting
+// insert, COMMIT. Nothing can know a record is a duplicate before BEGIN, so three
+// is the floor for this architecture rather than a cost worth removing — but §11.5
+// makes the duplicate path the demo's headline, so the number should be right.
 ```
 
 - [ ] **Step 3: Write the failing tests**
@@ -2224,10 +2260,7 @@ const testConsumer = "notifications.welcome-email"
 
 func newProcess(t *testing.T) (*ProcessUserRegistered, *fakeUOW) {
 	t.Helper()
-	uow := &fakeUOW{
-		inbox:         &fakeInbox{first: true},
-		notifications: &fakeNotifications{},
-	}
+	uow := &fakeUOW{claimed: true, notifications: &fakeNotifications{}}
 	uc := NewProcessUserRegistered(
 		uow,
 		fixedIDs{next: uuid.MustParse("0199a4f0-0000-7000-8000-00000000000a")},
@@ -2237,41 +2270,38 @@ func newProcess(t *testing.T) (*ProcessUserRegistered, *fakeUOW) {
 	return uc, uow
 }
 
-func TestProcessUserRegistered_WritesTheInboxRowThenTheNotification(t *testing.T) {
+func TestProcessUserRegistered_ClaimsTheEventAndWritesTheNotification(t *testing.T) {
 	uc, uow := newProcess(t)
 
 	res, err := uc.Execute(context.Background(), validRecord(t, nil))
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if !res.Recorded || res.Duplicate || res.Ignored {
-		t.Fatalf("result = %+v, want Recorded", res)
+	if res.Outcome != OutcomeRecorded {
+		t.Fatalf("Outcome = %v, want recorded", res.Outcome)
 	}
 	if !uow.committed {
 		t.Error("the transaction did not commit")
 	}
 
-	// The order is the mechanism (§11.3): the inbox decides whether any other
-	// write happens, so it has to be first. A test that only asserted both writes
-	// occurred would pass against the shape that reprocesses.
-	if want := []string{"inbox", "notification"}; !equal(uow.ops, want) {
-		t.Errorf("ops = %v, want %v", uow.ops, want)
+	// The claim carries this consumer's name and the inbound event's identity —
+	// the same id that becomes the gateway's Idempotency-Key. One identity, three
+	// mechanisms.
+	if uow.lastClaim.Consumer != testConsumer {
+		t.Errorf("claim consumer = %q, want %q", uow.lastClaim.Consumer, testConsumer)
 	}
-
-	if got := uow.inbox.calls; len(got) != 1 || got[0].consumer != testConsumer {
-		t.Errorf("inbox calls = %+v, want one for %q", got, testConsumer)
+	if uow.lastClaim.EventID.String() != "0199a4f0-0000-7000-8000-00000000000c" {
+		t.Errorf("claim event id = %v", uow.lastClaim.EventID)
 	}
-	// The inbox key is the inbound event id, which is also what becomes the
-	// gateway's Idempotency-Key. One identity, used by three mechanisms.
-	if uow.inbox.calls[0].eventID.String() != "0199a4f0-0000-7000-8000-00000000000c" {
-		t.Errorf("inbox event id = %v", uow.inbox.calls[0].eventID)
+	if uow.lastClaim.EventType != validRecord(t, nil).EventType {
+		t.Errorf("claim event type = %q", uow.lastClaim.EventType)
 	}
 }
 
-// The notification the transaction inserts carries an event, and the unit of work
-// is what turns that event into the send-intent row. The use case never mentions
-// an outbox, and this test asserts that the *aggregate* is the thing that carries
-// the intent out — which is what makes the guarantee structural.
+// The notification the transaction inserts carries an event, and the boundary is
+// what turns that event into the send-intent row. The use case never mentions an
+// outbox; this asserts that the *aggregate* is what carries the intent out, which
+// is what makes the guarantee structural.
 func TestProcessUserRegistered_TheNotificationCarriesTheSendIntent(t *testing.T) {
 	uc, uow := newProcess(t)
 
@@ -2292,49 +2322,31 @@ func TestProcessUserRegistered_TheNotificationCarriesTheSendIntent(t *testing.T)
 	}
 }
 
-// The headline case. A duplicate short-circuits before any work: no notification,
-// and — the assertion that matters — nothing for the unit of work to drain, so no
-// second send-intent. "Already processed" that still emitted an intent would be a
-// second email with an inbox that thinks it did its job.
+// The headline case, and note what it can no longer get wrong: fn is never called
+// for a duplicate, so there is no ordering to assert and no way to write the two
+// statements in the wrong order. The old shape needed a test that asserted the
+// *sequence* of writes and admitted its own failure mode was silent.
 func TestProcessUserRegistered_ADuplicateDoesNoWork(t *testing.T) {
 	uc, uow := newProcess(t)
-	uow.inbox.first = false
+	uow.claimed = false
 
 	res, err := uc.Execute(context.Background(), validRecord(t, nil))
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if !res.Duplicate || res.Recorded {
-		t.Fatalf("result = %+v, want Duplicate", res)
+	if res.Outcome != OutcomeDuplicate {
+		t.Fatalf("Outcome = %v, want duplicate", res.Outcome)
 	}
-	// It still commits. The inbox insert is a real write even when it conflicts —
-	// and more importantly, rolling back here would leave the offset uncommitted
-	// and the record redelivered forever.
+	// It still commits: the transaction did real work, and rolling back would
+	// leave the offset uncommitted and the record redelivered forever.
 	if !uow.committed {
 		t.Error("a duplicate rolled back; it must commit so the offset can advance")
 	}
+	if uow.fnCalls != 0 {
+		t.Errorf("fn ran %d times for a duplicate, want 0", uow.fnCalls)
+	}
 	if len(uow.notifications.inserted) != 0 {
 		t.Errorf("a duplicate inserted %d notifications, want 0", len(uow.notifications.inserted))
-	}
-	if want := []string{"inbox"}; !equal(uow.ops, want) {
-		t.Errorf("ops = %v, want %v — a duplicate must touch nothing else", uow.ops, want)
-	}
-}
-
-// The database's second line of defence, reached only if the inbox failed to stop
-// a duplicate — a bug, or an inbox row purged while the event was still on the
-// topic (§12.3). It is reported as a duplicate, not as a failure, because the
-// outcome is the one we wanted; the worker logs it loudly.
-func TestProcessUserRegistered_ADuplicateSourceIsAbsorbed(t *testing.T) {
-	uc, uow := newProcess(t)
-	uow.notifications.err = domain.ErrDuplicateSource
-
-	res, err := uc.Execute(context.Background(), validRecord(t, nil))
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	if !res.Duplicate || !res.ConstraintCaught {
-		t.Fatalf("result = %+v, want Duplicate with ConstraintCaught", res)
 	}
 }
 
@@ -2349,8 +2361,8 @@ func TestProcessUserRegistered_AMalformedRecordIsPermanentAndOpensNoTransaction(
 		t.Fatalf("err = %v, want ErrPermanent", err)
 	}
 	// Translation happens before the transaction. A record that can never be
-	// processed must not cost a BEGIN, and — more to the point — must not be able
-	// to leave a transaction open on the way to the dead-letter topic.
+	// processed must not cost a BEGIN, and must not be able to leave a transaction
+	// open on the way to the dead-letter topic.
 	if uow.calls != 0 {
 		t.Errorf("opened %d transactions for a record that will never be valid", uow.calls)
 	}
@@ -2365,12 +2377,13 @@ func TestProcessUserRegistered_AnUnhandledEventTypeIsIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute returned an error for an unhandled type: %v", err)
 	}
-	if !res.Ignored || res.Recorded || res.Duplicate {
-		t.Fatalf("result = %+v, want Ignored", res)
+	if res.Outcome != OutcomeIgnored {
+		t.Fatalf("Outcome = %v, want ignored", res.Outcome)
 	}
-	// No transaction, and specifically no inbox row: see ErrNotForThisConsumer.
-	// An inbox row here would make every one of these records invisible to the
-	// future notifier that finally handles the type.
+	// No transaction, and specifically no inbox row: an inbox row records that
+	// this consumer processed an event, and writing one for an event it declined
+	// to understand would hide the record from the notifier that finally handles
+	// the type.
 	if uow.calls != 0 {
 		t.Errorf("opened %d transactions for an event it does not handle", uow.calls)
 	}
@@ -2380,7 +2393,7 @@ func TestProcessUserRegistered_AnUnhandledEventTypeIsIgnored(t *testing.T) {
 // machine is not. Dead-lettering a valid registration because the entropy pool
 // hiccuped would be a permanent decision about a temporary condition.
 func TestProcessUserRegistered_AFailedIDIsTransient(t *testing.T) {
-	uow := &fakeUOW{inbox: &fakeInbox{first: true}, notifications: &fakeNotifications{}}
+	uow := &fakeUOW{claimed: true, notifications: &fakeNotifications{}}
 	uc := NewProcessUserRegistered(uow, fixedIDs{err: errors.New("no entropy")},
 		fixedClock{}, testConsumer)
 
@@ -2393,11 +2406,10 @@ func TestProcessUserRegistered_AFailedIDIsTransient(t *testing.T) {
 	}
 }
 
-// A database failure is returned unclassified-as-transient and the transaction
-// does not commit, so the worker declines to commit the offset and Kafka
-// redelivers (§12.2 rung 2). The important half is what did *not* happen: no
-// offset commit, which is the only thing standing between a transient failure and
-// silent loss.
+// A database failure returns unclassified and the transaction does not commit, so
+// the worker declines to commit the offset and Kafka redelivers (§12.2 rung 2).
+// The important half is what did *not* happen: no offset commit, which is the only
+// thing standing between a transient failure and silent loss.
 func TestProcessUserRegistered_ADatabaseFailureRollsBack(t *testing.T) {
 	uc, uow := newProcess(t)
 	uow.notifications.err = errors.New("connection reset")
@@ -2410,10 +2422,28 @@ func TestProcessUserRegistered_ADatabaseFailureRollsBack(t *testing.T) {
 	}
 }
 
-// The trace survives the hop. This is the assertion that keeps §9.2's promise
-// meaningful across two databases: the metadata handed to the transaction is the
-// metadata that came off the record, and the unit of work is what puts it on the
-// outgoing envelope.
+// A unique violation on source_event_id — the §8.2 backstop — comes out as an
+// ordinary unclassified error, and that is the decision, not an omission. See the
+// note after Step 5.
+func TestProcessUserRegistered_ADuplicateSourceIsNotSpeciallyAbsorbed(t *testing.T) {
+	uc, uow := newProcess(t)
+	uow.notifications.err = errors.New(`ERROR: duplicate key value violates unique ` +
+		`constraint "notifications_source_event_id_key" (SQLSTATE 23505)`)
+
+	res, err := uc.Execute(context.Background(), validRecord(t, nil))
+	if err == nil {
+		t.Fatal("expected the constraint violation to surface as an error")
+	}
+	if res.Outcome != OutcomeRecorded && res.Outcome != 0 {
+		t.Errorf("Outcome = %v; a failed pass reports no outcome", res.Outcome)
+	}
+	if uow.committed {
+		t.Error("committed after a constraint violation")
+	}
+}
+
+// The trace survives the hop — the assertion that keeps §9.2's promise meaningful
+// across two databases.
 func TestProcessUserRegistered_CarriesTheTraceOntoTheTransaction(t *testing.T) {
 	uc, uow := newProcess(t)
 	msg := validRecord(t, nil)
@@ -2434,76 +2464,52 @@ func TestProcessUserRegistered_CarriesTheTraceOntoTheTransaction(t *testing.T) {
 Add to `fakes_test.go`:
 
 ```go
-// fakeUOW runs fn immediately and records the write order, because in this use
-// case the order *is* the mechanism.
+// fakeUOW runs fn immediately, unless claimed is false — in which case it must
+// not run it at all, which is the property the real boundary provides and the
+// reason this fake models the claim rather than a repository call.
 type fakeUOW struct {
 	calls         int
+	fnCalls       int
 	committed     bool
+	claimed       bool
 	lastMeta      Metadata
-	ops           []string
-	inbox         *fakeInbox
+	lastClaim     InboxClaim
 	notifications *fakeNotifications
 	commitErr     error
 }
 
-func (f *fakeUOW) Do(ctx context.Context, meta Metadata, fn func(Work) error) error {
+func (f *fakeUOW) Do(
+	ctx context.Context, meta Metadata, claim InboxClaim, fn func(Work) error,
+) (bool, error) {
 	f.calls++
 	f.lastMeta = meta
-	f.inbox.record = func() { f.ops = append(f.ops, "inbox") }
-	f.notifications.record = func() { f.ops = append(f.ops, "notification") }
-	if err := fn(Work{Notifications: f.notifications, Inbox: f.inbox}); err != nil {
-		return err
+	f.lastClaim = claim
+	if !f.claimed {
+		f.committed = true
+		return false, nil
+	}
+	f.fnCalls++
+	if err := fn(Work{Notifications: f.notifications}); err != nil {
+		return false, err
 	}
 	if f.commitErr != nil {
-		return f.commitErr
+		return false, f.commitErr
 	}
 	f.committed = true
-	return nil
-}
-
-type inboxCall struct {
-	consumer  string
-	eventID   uuid.UUID
-	eventType string
-}
-
-type fakeInbox struct {
-	first  bool
-	err    error
-	calls  []inboxCall
-	record func()
-}
-
-func (f *fakeInbox) Record(_ context.Context, consumer string, eventID uuid.UUID, eventType string) (bool, error) {
-	if f.record != nil {
-		f.record()
-	}
-	f.calls = append(f.calls, inboxCall{consumer: consumer, eventID: eventID, eventType: eventType})
-	if f.err != nil {
-		return false, f.err
-	}
-	return f.first, nil
+	return true, nil
 }
 
 type fakeNotifications struct {
 	inserted []*domain.Notification
 	err      error
-	record   func()
 }
 
 func (f *fakeNotifications) Insert(_ context.Context, n *domain.Notification) error {
-	if f.record != nil {
-		f.record()
-	}
 	if f.err != nil {
 		return f.err
 	}
 	f.inserted = append(f.inserted, n)
 	return nil
-}
-
-func equal(got, want []string) bool {
-	return slices.Equal(got, want)
 }
 ```
 
@@ -2521,7 +2527,6 @@ package application
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -2530,32 +2535,48 @@ import (
 	"github.com/AymanKastali/outboxexpress/internal/platform/messaging"
 )
 
-// ProcessResult is what one record's processing did. Every field on it becomes a
-// field on the worker's log line, because a use case does not log (§6.1, §13.3) —
-// and because a number that reaches a dashboard through a result struct is a
-// number a unit test can assert.
-type ProcessResult struct {
-	// Recorded: the inbox row was new and the work was done.
-	Recorded bool
+// Outcome is what happened to one record. Exactly one of these is true of any
+// processed record, which is why it is an enum and not a set of booleans: four
+// independent flags would admit sixteen states for three legal ones, and every
+// call site would assert a conjunction to pin one of them.
+type Outcome int
 
-	// Duplicate: this consumer had already processed the event, so nothing
+const (
+	// OutcomeRecorded: the claim was new and the work was done.
+	OutcomeRecorded Outcome = iota + 1
+
+	// OutcomeDuplicate: this consumer had already processed the event, so nothing
 	// happened. §13.3: "a non-zero duplicate count is healthy, not an error." It
 	// is the visible evidence that the inbox is doing its job.
-	Duplicate bool
+	OutcomeDuplicate
 
-	// ConstraintCaught is set when the duplicate was caught by
-	// notifications.source_event_id UNIQUE rather than by the inbox. Both outcomes
-	// are correct, but they are not equally interesting: this one means the first
-	// line of defence did not hold, which is either a bug or an inbox row purged
-	// while its event was still on the topic (§12.3). The worker logs it at WARN.
-	ConstraintCaught bool
+	// OutcomeIgnored: an event type this consumer does not map. Not work, not a
+	// failure, and not an inbox row (see handles).
+	OutcomeIgnored
+)
 
-	// Ignored: an event type this consumer does not handle. Not work, not a
-	// failure, and not an inbox row (see ErrNotForThisConsumer).
-	Ignored bool
+func (o Outcome) String() string {
+	switch o {
+	case OutcomeRecorded:
+		return "recorded"
+	case OutcomeDuplicate:
+		return "duplicate"
+	case OutcomeIgnored:
+		return "ignored"
+	default:
+		return "none"
+	}
+}
 
-	// NotificationID is set when Recorded, for the log line. It is the row a human
-	// asked "did we send it?" would look up.
+// ProcessResult is what one record's processing did. Every field on it becomes a
+// field on the worker's log line, because a use case does not log (§6.1, §13.3) —
+// and because a value that reaches a dashboard through a result struct is a value
+// a unit test can assert.
+type ProcessResult struct {
+	Outcome Outcome
+
+	// NotificationID is set on OutcomeRecorded, for the log line. It is the row a
+	// human asking "did we send it?" would look up.
 	NotificationID uuid.UUID
 }
 
@@ -2563,8 +2584,13 @@ type ProcessResult struct {
 // notifications context is a separate service with a separate database.
 //
 // One transaction, three writes: the inbox row, the notification row, and — drained
-// structurally by the same unit of work, never mentioned here — the send-intent row
-// in notifications.outbox. Then, and only then, the worker commits the offset.
+// structurally by the same boundary, never mentioned here — the send-intent row in
+// notifications.outbox. Then, and only then, the worker commits the offset.
+//
+// Two of those three writes are the boundary's, not this use case's. The inbox
+// claim is Do's first statement and the send-intent is drained after fn returns;
+// what this function asks for is one insert. That is deliberate — see
+// UnitOfWork.Do — and it means neither ordering can be got wrong here.
 //
 // Why the atomicity is not optional (§11.3):
 //
@@ -2600,23 +2626,23 @@ func NewProcessUserRegistered(uow UnitOfWork, ids IDGen, clk Clock, consumer str
 }
 
 func (uc *ProcessUserRegistered) Execute(ctx context.Context, msg messaging.Message) (ProcessResult, error) {
+	// Not work, not a failure, and no inbox row: the offset advances and this
+	// process forgets the record, which is the only outcome that leaves a future
+	// notifier free to handle the type properly.
+	if !handles(msg) {
+		return ProcessResult{Outcome: OutcomeIgnored}, nil
+	}
+
 	// The anti-corruption layer. Accounts' published language is translated into
 	// this context's vocabulary here and nowhere else; no code below this line has
 	// ever seen what accounts calls its fields (§11.3).
 	req, err := translate(msg)
-	switch {
-	case errors.Is(err, ErrNotForThisConsumer):
-		// Not work, not a failure, and no inbox row: the offset advances and this
-		// process forgets the record, which is the only outcome that leaves a
-		// future notifier free to handle the type properly.
-		return ProcessResult{Ignored: true}, nil
-	case err != nil:
+	if err != nil {
 		return ProcessResult{}, err // already ErrPermanent -> the dead-letter topic
 	}
 
-	// Everything nondeterministic happens before the transaction opens, so that a
-	// BEGIN is never held open across a failure that has nothing to do with the
-	// database.
+	// Everything nondeterministic happens before the transaction opens, so a BEGIN
+	// is never held open across a failure that has nothing to do with the database.
 	id, err := uc.ids.New()
 	if err != nil {
 		// Transient, not permanent: the record is valid and the machine is not.
@@ -2630,68 +2656,54 @@ func (uc *ProcessUserRegistered) Execute(ctx context.Context, msg messaging.Mess
 		return ProcessResult{}, fmt.Errorf("%w: event %s: %v", ErrPermanent, req.SourceEventID, err)
 	}
 
-	res := ProcessResult{}
-	err = uc.uow.Do(ctx, metadataFrom(msg.Headers), func(w Work) error {
-		// First, before any other write. A duplicate then costs one round trip and
-		// touches nothing, and the two writes below are unreachable for a record
-		// this consumer has already processed.
-		first, err := w.Inbox.Record(ctx, uc.consumer, req.SourceEventID, msg.EventType)
-		if err != nil {
-			return err
-		}
-		if !first {
-			res.Duplicate = true
-			return nil // already processed; no work, and the transaction still commits
-		}
+	claim := InboxClaim{
+		Consumer:  uc.consumer,
+		EventID:   req.SourceEventID,
+		EventType: msg.EventType,
+	}
 
-		// Inserting the aggregate is the only write this use case makes. The
-		// send-intent row is the unit of work's business, drained from the events
-		// the aggregate recorded — which is why there is no outbox in Work and no
-		// mention of one here (§5, §6.4).
-		if err := w.Notifications.Insert(ctx, notif); err != nil {
-			// The UNIQUE on source_event_id, reached only if the inbox did not
-			// stop a duplicate. The outcome is the one we wanted, so it is not a
-			// failure — but it is worth distinguishing, because it means the first
-			// mechanism did not hold (§8.2, §12.3).
-			if errors.Is(err, domain.ErrDuplicateSource) {
-				res.Duplicate = true
-				res.ConstraintCaught = true
-				return nil
-			}
-			return err
-		}
-		res.Recorded = true
-		res.NotificationID = notif.ID()
-		return nil
+	// Inserting the aggregate is the only write this use case makes. The claim is
+	// the boundary's first statement and the send-intent row is drained from the
+	// events the aggregate recorded — which is why there is no inbox and no outbox
+	// in Work, and no mention of either here (§5, §6.4).
+	claimed, err := uc.uow.Do(ctx, metadataFrom(msg.Headers), claim, func(w Work) error {
+		return w.Notifications.Insert(ctx, notif)
 	})
 	if err != nil {
 		// Unclassified, and left that way. The worker treats an unclassified error
 		// as transient and declines to commit the offset, so Kafka redelivers —
-		// which is the safe default in this direction (see consuming.go).
+		// the safe default in this direction (see consuming.go).
 		return ProcessResult{}, err
 	}
-	return res, nil
+	if !claimed {
+		return ProcessResult{Outcome: OutcomeDuplicate}, nil
+	}
+	return ProcessResult{Outcome: OutcomeRecorded, NotificationID: notif.ID()}, nil
 }
 ```
 
-Note on the `ConstraintCaught` path: it returns `nil` from inside the transaction, and that is a real subtlety. In PostgreSQL a unique violation aborts the transaction, so the *implementation* of this must not swallow the error and continue writing — it does not, because there is nothing after it, and the commit of an aborted transaction returns `ErrTxCommitRollback` which surfaces as an error from `Do`. Task 8's integration test asserts the real behaviour against a real database; if it turns out that a `ConstraintCaught` result cannot be produced without a savepoint, the correct resolution is to report it as a transient error rather than to add a savepoint — the inbox is the mechanism, this is the backstop, and a backstop that costs a savepoint on every insert is not worth it. Record whichever way it lands in the plan's post-implementation notes.
+**Note on `notifications.source_event_id UNIQUE`, decided rather than deferred.** §8.2 calls that constraint "redundant with the inbox by design… a bug in the inbox path still cannot produce two notification rows", and an earlier draft of this plan tried to report reaching it as a third kind of duplicate. It cannot be reported. PostgreSQL aborts a transaction on any statement error, so a 23505 on the notification insert leaves the commit returning `ErrTxCommitRollback` — the outcome is an error out of `Do`, and no amount of branching inside `fn` changes that. Making it reportable would cost a savepoint on every insert, on the hot path, to distinguish two states that both mean "the inbox did not hold".
+
+So it surfaces as an ordinary unclassified error with the constraint name in its text. The worker treats it as transient, the record climbs the ladder, and it dead-letters at `CONSUMER_MAX_DELIVERIES` with `notifications_source_event_id_key` in `dlt_error` — which is a louder and more actionable signal than the WARN line the earlier draft wanted, and costs nothing. There is therefore no `domain.ErrDuplicateSource`, no `isUniqueViolation` branch in the repository, and no result field for it.
+
+The general lesson, and the reason this note stays in the plan: a fake unit of work that keeps running after a repository error is *more permissive than the database it stands for*, and a test green against that fake would have guarded nothing. Any fake that models a transaction must refuse to continue after an error, or it will eventually certify a design PostgreSQL cannot execute.
 
 - [ ] **Step 6: Run the tests**
 
 Run: `go test ./internal/notifications/application/ -v`
-Expected: PASS. Add `slices` to `fakes_test.go`'s imports.
+Expected: PASS.
 
-- [ ] **Step 7: Prove the duplicate test has teeth**
+- [ ] **Step 7: Prove the duplicate short-circuit is structural, not asserted**
 
-Temporarily move the `w.Inbox.Record` call *after* `w.Notifications.Insert`. Run `TestProcessUserRegistered_ADuplicateDoesNoWork` — it must fail on the `ops` assertion. Restore.
+There is nothing to sabotage here, and that is the point of the change: try to write a version of `Execute` that inserts the notification before the claim. You cannot — `fn` runs inside `Do`, after the claim, or not at all. Confirm by attempting it for thirty seconds, then move on.
 
-This is the one test in the plan whose failure mode is silent: with the writes in the wrong order every other assertion still passes, because a duplicate would still be reported as a duplicate. It would just have inserted a notification first.
+What to check instead is the fake: set `uow.claimed = false` and make `fn` panic. `TestProcessUserRegistered_ADuplicateDoesNoWork` must still pass, because `fn` is never called.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 git add internal/notifications/application
-git commit -m "feat(notifications): the consuming transaction, inbox first"
+git commit -m "feat(notifications): the boundary claims the event, so inbox-first is not a rule"
 ```
 
 ---
@@ -2704,9 +2716,11 @@ git commit -m "feat(notifications): the consuming transaction, inbox first"
 
 **Interfaces:**
 - Consumes: `internal/notifications/application` (Tasks 4–6), `internal/notifications/domain`, `platformpg.WithTx`, `platformpg.Queryer`, `pgtest.Notifications`.
-- Produces: `NewUnitOfWork(pool *pgxpool.Pool, envelopes application.EnvelopeFactory) *UnitOfWork`; `NewInboxRepository(q platformpg.Queryer) *InboxRepository`; `newNotificationRepository(q platformpg.Queryer, tr *tracker) *NotificationRepository`; `NewOutboxRepository(q platformpg.Queryer) *OutboxRepository`.
+- Produces: `NewUnitOfWork(pool *pgxpool.Pool, envelopes application.EnvelopeFactory) *UnitOfWork`; `newInboxRepository(q platformpg.Queryer) *inboxRepository`; `newNotificationRepository(q platformpg.Queryer, tr *tracker) *NotificationRepository`; `NewOutboxRepository(q platformpg.Queryer) *OutboxRepository`.
 
-Structurally accounts' `uow.go` with a second repository in the work set and a second table drained into. The one genuinely new piece of SQL in the plan is the inbox's, and it is three lines that decide whether the whole design works.
+Structurally accounts' `uow.go`, with the claim as the transaction's first statement and a second table drained into. The one genuinely new piece of SQL in the plan is the inbox's, and it is three lines that decide whether the whole design works.
+
+The inbox repository is unexported — type and constructor both. Its only caller is the unit of work in this package, and an exported one would let a process take a deduplication decision outside the transaction that decision exists to protect.
 
 - [ ] **Step 1: Write the failing integration test for the inbox**
 
@@ -2723,34 +2737,40 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/AymanKastali/outboxexpress/internal/notifications/application"
 	"github.com/AymanKastali/outboxexpress/internal/platform/pgtest"
 )
 
-// The mechanism, against a real database. ON CONFLICT DO NOTHING reports zero
-// rows for a repeat, which is what "not first" means — and it means it under
+func claimFor(eventID uuid.UUID, consumer string) application.InboxClaim {
+	return application.InboxClaim{
+		Consumer: consumer, EventID: eventID, EventType: "com.example.thing"}
+}
+
+// The mechanism, against a real database. ON CONFLICT DO NOTHING affects zero rows
+// for a repeat, which is what "not first" means — and it means it under
 // concurrency, which no in-memory check can (§12 mechanism 3).
-func TestInboxRepository_RecordIsFirstExactlyOnce(t *testing.T) {
+func TestInboxRepository_ClaimIsFirstExactlyOnce(t *testing.T) {
+	// pgtest.Notifications truncates all three tables before it returns; a second
+	// Truncate here would teach the next reader that it does not.
 	_, pool := pgtest.Notifications(t)
-	pgtest.Truncate(t, pool, "notifications.inbox")
 	ctx := context.Background()
 	eventID := uuid.New()
+	repo := newInboxRepository(pool)
 
-	repo := NewInboxRepository(pool)
-
-	first, err := repo.Record(ctx, "notifications.welcome-email", eventID, "com.example.thing")
+	first, err := repo.record(ctx, claimFor(eventID, "notifications.welcome-email"))
 	if err != nil {
-		t.Fatalf("Record: %v", err)
+		t.Fatalf("record: %v", err)
 	}
 	if !first {
-		t.Fatal("the first Record reported not-first")
+		t.Fatal("the first claim reported not-first")
 	}
 
-	again, err := repo.Record(ctx, "notifications.welcome-email", eventID, "com.example.thing")
+	again, err := repo.record(ctx, claimFor(eventID, "notifications.welcome-email"))
 	if err != nil {
-		t.Fatalf("second Record: %v", err)
+		t.Fatalf("second record: %v", err)
 	}
 	if again {
-		t.Error("the second Record reported first; the inbox is not deduplicating")
+		t.Error("the second claim reported first; the inbox is not deduplicating")
 	}
 }
 
@@ -2759,15 +2779,14 @@ func TestInboxRepository_RecordIsFirstExactlyOnce(t *testing.T) {
 // keeps the column meaningful for the second.
 func TestInboxRepository_TwoConsumersEachGetTheEventOnce(t *testing.T) {
 	_, pool := pgtest.Notifications(t)
-	pgtest.Truncate(t, pool, "notifications.inbox")
 	ctx := context.Background()
 	eventID := uuid.New()
-	repo := NewInboxRepository(pool)
+	repo := newInboxRepository(pool)
 
 	for _, consumer := range []string{"notifications.welcome-email", "notifications.audit"} {
-		first, err := repo.Record(ctx, consumer, eventID, "com.example.thing")
+		first, err := repo.record(ctx, claimFor(eventID, consumer))
 		if err != nil {
-			t.Fatalf("Record(%s): %v", consumer, err)
+			t.Fatalf("record(%s): %v", consumer, err)
 		}
 		if !first {
 			t.Errorf("%s did not get the event", consumer)
@@ -2775,16 +2794,15 @@ func TestInboxRepository_TwoConsumersEachGetTheEventOnce(t *testing.T) {
 	}
 }
 
-// Two concurrent Records for the same key: exactly one first, and no error. This
-// is the property the primary key provides and a SELECT-then-INSERT would not —
-// two notifiers in a rebalance window can be processing the same record, and the
-// loser must learn that it lost rather than fail.
-func TestInboxRepository_ConcurrentRecordsElectOneWinner(t *testing.T) {
+// Two concurrent claims for the same key: exactly one first, and no error. This is
+// the property the primary key provides and a SELECT-then-INSERT would not — two
+// notifiers in a rebalance window can be processing the same record, and the loser
+// must learn that it lost rather than fail.
+func TestInboxRepository_ConcurrentClaimsElectOneWinner(t *testing.T) {
 	_, pool := pgtest.Notifications(t)
-	pgtest.Truncate(t, pool, "notifications.inbox")
 	ctx := context.Background()
-	eventID := uuid.New()
-	repo := NewInboxRepository(pool)
+	claim := claimFor(uuid.New(), "notifications.welcome-email")
+	repo := newInboxRepository(pool)
 
 	const racers = 8
 	results := make(chan bool, racers)
@@ -2793,7 +2811,7 @@ func TestInboxRepository_ConcurrentRecordsElectOneWinner(t *testing.T) {
 	for range racers {
 		go func() {
 			<-start
-			first, err := repo.Record(ctx, "notifications.welcome-email", eventID, "com.example.thing")
+			first, err := repo.record(ctx, claim)
 			if err != nil {
 				errs <- err
 				return
@@ -2807,7 +2825,7 @@ func TestInboxRepository_ConcurrentRecordsElectOneWinner(t *testing.T) {
 	for range racers {
 		select {
 		case err := <-errs:
-			t.Fatalf("Record: %v", err)
+			t.Fatalf("record: %v", err)
 		case first := <-results:
 			if first {
 				firsts++
@@ -2823,88 +2841,84 @@ func TestInboxRepository_ConcurrentRecordsElectOneWinner(t *testing.T) {
 - [ ] **Step 2: Run it and watch it fail**
 
 Run: `go test -tags=integration ./internal/notifications/infrastructure/postgres/ -run TestInboxRepository -v`
-Expected: FAIL — `undefined: NewInboxRepository`.
+Expected: FAIL — `undefined: newInboxRepository`.
 
 - [ ] **Step 3: Write `inbox_repo.go`**
 
 ```go
 // Package postgres is the notifications context's persistence layer: the inbox,
 // the Notification repository, the consumer's own outbox, and the unit of work
-// that makes the send-intent insert structural.
+// that claims an event and makes the send-intent insert structural.
 package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
-
-	"github.com/google/uuid"
-
+	"github.com/AymanKastali/outboxexpress/internal/notifications/application"
 	platformpg "github.com/AymanKastali/outboxexpress/internal/platform/postgres"
 )
 
 // The idempotent consumer, in three lines of SQL.
 //
-// ON CONFLICT DO NOTHING with a RETURNING clause is the whole mechanism: the
-// statement inserts and reports a row when the event is new, and reports nothing
-// when the primary key already holds it. It is one round trip, it is atomic, and
-// it works under concurrency — which a SELECT followed by an INSERT does not, and
-// the difference shows up exactly during a consumer-group rebalance, when two
-// members can briefly be processing the same record (§12).
+// ON CONFLICT DO NOTHING is the whole mechanism: the statement inserts when the
+// event is new and does nothing when the primary key already holds it, reporting
+// which happened as the row count. One round trip, atomic, and correct under
+// concurrency — which a SELECT followed by an INSERT is not, and the difference
+// shows up exactly during a consumer-group rebalance, when two members can briefly
+// be processing the same record (§12).
+//
+// There is no RETURNING clause. An earlier draft had one, on the theory that the
+// statement needed to return something in order to report a conflict; it does not.
+// pgconn.CommandTag.RowsAffected answers the only question being asked, and a
+// RETURNING would put a result-row descriptor, a timestamptz on the wire and a
+// time.Time decode on the first statement of every consuming transaction, for a
+// value nothing reads. accounts' markOne already uses the row count for exactly
+// this question.
 //
 // processed_at takes its column default, which is now() — and in PostgreSQL now()
-// is transaction_timestamp(), so every row a transaction writes shares one
-// instant. That is the right timestamp here: the inbox records when the consuming
+// is transaction_timestamp(), so every row a transaction writes shares one instant.
+// That is the right timestamp here: the inbox records when the consuming
 // transaction happened, not when this statement within it did.
 const recordInbox = `
 INSERT INTO notifications.inbox (consumer, event_id, event_type)
 VALUES ($1, $2, $3)
-ON CONFLICT (consumer, event_id) DO NOTHING
-RETURNING processed_at`
+ON CONFLICT (consumer, event_id) DO NOTHING`
 
-type InboxRepository struct {
+// inboxRepository is unexported, type and constructor both. Its only caller is
+// this package's unit of work, and an exported one would let a process take a
+// deduplication decision outside the transaction it exists to protect.
+type inboxRepository struct {
 	q platformpg.Queryer
 }
 
-func NewInboxRepository(q platformpg.Queryer) *InboxRepository {
-	return &InboxRepository{q: q}
+func newInboxRepository(q platformpg.Queryer) *inboxRepository {
+	return &inboxRepository{q: q}
 }
 
-// Record inserts and reports whether the row was new.
+// record claims the event for this consumer and reports whether the claim was new.
 //
-// pgx.ErrNoRows is the *success* path for a duplicate, which is why it is matched
-// explicitly and returned as (false, nil): a repeat is normal operation of an
-// at-least-once transport, not a failure (§13.3).
-func (r *InboxRepository) Record(
-	ctx context.Context, consumer string, eventID uuid.UUID, eventType string,
-) (bool, error) {
-	var processedAt time.Time
-	err := r.q.QueryRow(ctx, recordInbox, consumer, eventID, eventType).Scan(&processedAt)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		return false, nil
-	case err != nil:
-		return false, fmt.Errorf("postgres: record inbox (%s, %s): %w", consumer, eventID, err)
-	default:
-		return true, nil
+// A conflict is the *success* path, not an error: a repeat is normal operation of
+// an at-least-once transport (§13.3), and returning an error for one would put it
+// on the same path as a broken database.
+func (r *inboxRepository) record(ctx context.Context, claim application.InboxClaim) (bool, error) {
+	tag, err := r.q.Exec(ctx, recordInbox, claim.Consumer, claim.EventID, claim.EventType)
+	if err != nil {
+		return false, fmt.Errorf("postgres: claim inbox (%s, %s): %w",
+			claim.Consumer, claim.EventID, err)
 	}
+	return tag.RowsAffected() == 1, nil
 }
-
-var _ application.InboxRepository = (*InboxRepository)(nil)
 ```
 
-Add `time` and the `application` import; the scan target is discarded but `RETURNING` needs one, and scanning the real timestamp rather than a `struct{}` keeps the statement honest about what it returns.
-
-- [ ] **Step 4: Run it and watch it pass**
+- [ ] **Step 4: Run it and watch the three tests pass**
 
 Run: `go test -tags=integration ./internal/notifications/infrastructure/postgres/ -run TestInboxRepository -v`
 Expected: PASS, all three.
 
 - [ ] **Step 5: Write `tracker.go` and its unit test**
 
-Copy `internal/accounts/infrastructure/postgres/tracker.go` and its test, substituting `*domain.Notification` for `*domain.User`. The comment explaining why the tracker exists — a repository records which aggregates it persisted, so the unit of work can drain their events without the use case asking — carries over unchanged. Adjust it to name this context's aggregate and add one sentence: the tracker is per-context for the same reason the recorder is, and the two contexts' trackers hold different aggregate types, so there is nothing to share even if sharing were desirable.
+Copy `internal/accounts/infrastructure/postgres/tracker.go` and its test, substituting `*domain.Notification` for `*domain.User`. The comment explaining why the tracker exists — a repository records which aggregates it persisted, so the unit of work can drain their events without the use case asking — carries over unchanged. Adjust it to name this context's aggregate and add one sentence: the tracker is per-context for the same reason the recorder is, and since the two contexts' trackers hold different aggregate types there is nothing to share even if sharing were desirable.
 
 - [ ] **Step 6: Write `notification_repo.go`**
 
@@ -2916,12 +2930,12 @@ INSERT INTO notifications.notifications
     (id, user_id, recipient, kind, state, source_event_id, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7)`
 
-// NotificationRepository writes the aggregate. It is unexported-constructed —
+// NotificationRepository writes the aggregate. Its constructor is unexported —
 // newNotificationRepository — because the only legitimate caller is this package's
 // unit of work, which binds it to a transaction and to a tracker. An exported
 // constructor would let a process wire one against the pool, and a notification
-// written outside the consuming transaction is the dual write this design exists
-// to prevent.
+// written outside the consuming transaction is the dual write this design exists to
+// prevent.
 type NotificationRepository struct {
 	q  platformpg.Queryer
 	tr *tracker
@@ -2931,40 +2945,41 @@ func newNotificationRepository(q platformpg.Queryer, tr *tracker) *NotificationR
 	return &NotificationRepository{q: q, tr: tr}
 }
 
-// Insert writes the row and tells the tracker, which is what makes the
-// send-intent structural: the unit of work drains this aggregate's events on the
-// way to commit, and the use case never mentions an outbox.
+// Insert writes the row and tells the tracker, which is what makes the send-intent
+// structural: the unit of work drains this aggregate's events on the way to commit,
+// and the use case never mentions an outbox.
 //
 // sent_at is not written. It is NULL until the sender sets it, and passing the
 // aggregate's zero time would write 0001-01-01 into a nullable column — a value
-// that reads as "sent, a very long time ago" to every query that checks the
-// column rather than the state.
+// that reads as "sent, a very long time ago" to every query that checks the column
+// rather than the state.
 func (r *NotificationRepository) Insert(ctx context.Context, n *domain.Notification) error {
 	_, err := r.q.Exec(ctx, insertNotification,
 		n.ID(), n.UserID(), n.Recipient().String(), n.Kind(),
 		n.State().String(), n.SourceEventID(), n.CreatedAt(),
 	)
 	if err != nil {
-		// The UNIQUE on source_event_id, translated into the domain's vocabulary
-		// so that the application layer can absorb it as a duplicate rather than
-		// matching on a driver error (§8.2). Same pattern as accounts'
-		// ErrEmailTaken: the rule is the domain's, the enforcement is the
-		// database's, and the translation happens here.
-		if isUniqueViolation(err, "notifications_source_event_id_key") {
-			return domain.ErrDuplicateSource
-		}
+		// No special case for the source_event_id UNIQUE. §8.2 calls that
+		// constraint a deliberate backstop behind the inbox, and reaching it means
+		// the inbox did not hold — but PostgreSQL aborts the transaction on a
+		// 23505, so there is nothing this layer could translate it into that the
+		// application layer could act on. It travels out as a wrapped driver error
+		// with the constraint name in its text, which is what a human reading
+		// dlt_error needs. See the note after Task 6, Step 5.
 		return fmt.Errorf("postgres: insert notification %s: %w", n.ID(), err)
 	}
 	r.tr.track(n)
 	return nil
 }
+
+var _ domain.NotificationRepository = (*NotificationRepository)(nil)
 ```
 
-`isUniqueViolation(err error, constraint string) bool` unwraps to `*pgconn.PgError` and compares `Code == "23505"` and `ConstraintName`. Accounts' `user_repo.go` already has this shape for `ErrEmailTaken` — read it and follow it; if it is written inline there, factor neither, because a two-line helper duplicated across two contexts is cheaper than a shared one (the same trade the recorder makes). Confirm the constraint name with `\d notifications.notifications` rather than guessing it: PostgreSQL derives it from the table and column, and a mistyped name would make this branch dead code that silently reports every insert failure as a driver error.
+Its integration test: insert one, read the row back, assert every column including `state = 'pending'` and `sent_at IS NULL`; then insert a second notification with the same `source_event_id` on a fresh connection and assert the error names `notifications_source_event_id_key`, because that string is what a human replaying from the DLT will search for.
 
 - [ ] **Step 7: Write `outbox_repo.go`**
 
-Accounts' `Append`, with `idempotency_key` added to the column list and `e.IdempotencyKey` to the batch. Keep the `pgx.Batch` and the comment about why: these inserts sit inside the consuming transaction, and a transaction open for N round trips holds its locks N times longer (§11.1 rule 4). Keep the leading comment about `status`, `attempts` and `available_at` taking their defaults, adjusted to name the sender as the owner of that bookkeeping.
+Accounts' `Append`, with `idempotency_key` added to the column list and `e.IdempotencyKey` to the values. Keep the leading comment about `status`, `attempts` and `available_at` taking their column defaults, adjusted to name the sender as the owner of that bookkeeping.
 
 ```go
 const insertOutbox = `
@@ -2974,15 +2989,41 @@ INSERT INTO notifications.outbox
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
 ```
 
-- [ ] **Step 8: Write `uow.go`**
-
-Accounts' `uow.go`, with two changes. The work set has two repositories; and the appender is this context's.
+**Do not copy accounts' batch comment unexamined.** There it argues about N round trips inside a business transaction; here N is always 1, pinned by two tests — `TestRequestWelcome_StartsPendingAndRecordsExactlyOneEvent` and `TestProcessUserRegistered_TheNotificationCarriesTheSendIntent`. So take the single-envelope case to a plain `Exec` and say what the batch is actually for:
 
 ```go
-// outboxAppender is the append role, declared at its consumer. It is not in the
-// application package because no use case mentions an outbox — that is the whole
-// point of §5, and an interface exported from application that nothing in
-// application uses invites exactly the reach-in that Work's comment warns about.
+// One event per notification today, pinned by the aggregate's tests, so the common
+// case is a single Exec. The batch below is not a saving being realised — it is
+// what keeps a second event type from arriving as a loop of round trips inside the
+// consuming transaction, which is the cost accounts' comment is about (§11.1
+// rule 4).
+if len(envelopes) == 1 {
+	e := envelopes[0]
+	if _, err := r.q.Exec(ctx, insertOutbox, e.EventID, e.AggregateType, e.AggregateID,
+		e.EventType, e.SchemaVersion, e.Payload, e.Headers, e.OccurredAt,
+		e.IdempotencyKey); err != nil {
+		return fmt.Errorf("postgres: append intent (event_id %s): %w", e.EventID, err)
+	}
+	return nil
+}
+```
+
+While you are here, count the transaction: BEGIN, claim, notification, intent, COMMIT — **five round trips** on the happy path, three on a duplicate. The notification insert and the intent append are the one combinable pair (always one row each, always both-or-neither, no result gating the second), and combining them would cut lock-hold time by about a fifth. It is not done, because the tracker only drains after `fn` returns and `Insert`'s error has to surface from inside `fn`. Record the number and the trade; do not quote a comment about round trips while leaving the round trips uncounted.
+
+- [ ] **Step 8: Write `uow.go`**
+
+Accounts' `uow.go`, with three changes: the claim runs first and gates `fn`, the work set holds one repository, and there is no injected-appender field.
+
+```go
+// The two roles the boundary needs, both declared at their consumer. Neither is in
+// the application package, because no use case mentions an inbox or an outbox —
+// that is the whole point of §5, and an interface exported from application that
+// nothing in application calls invites exactly the reach-in that Work's comment
+// warns about.
+type inboxClaimer interface {
+	record(ctx context.Context, claim application.InboxClaim) (bool, error)
+}
+
 type outboxAppender interface {
 	Append(ctx context.Context, envelopes []application.Envelope) error
 }
@@ -2990,46 +3031,84 @@ type outboxAppender interface {
 type UnitOfWork struct {
 	pool      *pgxpool.Pool
 	envelopes application.EnvelopeFactory
-
-	// outbox builds the appender for a transaction. A field rather than a direct
-	// call so that a test can substitute an appender that fails: "the send-intent
-	// insert failed, so the notification must not exist" is the dual-write refusal
-	// in its purest form, and there is no way to provoke it from outside — the
-	// factory mints a fresh UUIDv7 per event, so not even the event_id constraint
-	// can be made to fire.
-	outbox func(platformpg.Queryer) outboxAppender
 }
 
-func (u *UnitOfWork) Do(ctx context.Context, meta application.Metadata, fn func(application.Work) error) error {
-	return platformpg.WithTx(ctx, u.pool, func(tx pgx.Tx) error {
+func NewUnitOfWork(pool *pgxpool.Pool, envelopes application.EnvelopeFactory) *UnitOfWork {
+	return &UnitOfWork{pool: pool, envelopes: envelopes}
+}
+
+// Do claims the event, runs fn only if the claim was new, and drains the
+// aggregate's events into notifications.outbox on the way to commit.
+//
+// The three statements are in this order because the order is the mechanism, and
+// putting it here rather than in the use case is what makes it unswappable — see
+// application.UnitOfWork's doc comment and divergence 6.
+func (u *UnitOfWork) Do(
+	ctx context.Context,
+	meta application.Metadata,
+	claim application.InboxClaim,
+	fn func(application.Work) error,
+) (bool, error) {
+	var claimed bool
+	err := platformpg.WithTx(ctx, u.pool, func(tx pgx.Tx) error {
+		// First statement, before any other write. A record this consumer has
+		// already processed costs one insert that touches nothing, and fn — with
+		// the notification insert and the event drain behind it — is unreachable.
+		first, err := u.claimer(tx).record(ctx, claim)
+		if err != nil {
+			return err
+		}
+		if !first {
+			// Commit, deliberately. The transaction did real work, and rolling back
+			// would leave the offset uncommitted and the record redelivered forever.
+			return nil
+		}
+		claimed = true
+
 		tracker := newTracker()
 
-		// Both repositories are bound to tx and handed to fn as the only way to
-		// reach persistence. The pool is not reachable from here, so there is no
-		// path to an untransacted write.
-		work := application.Work{
+		// The repository is bound to tx and handed to fn as the only way to reach
+		// persistence. The pool is not reachable from here, so there is no path to
+		// an untransacted write.
+		if err := fn(application.Work{
 			Notifications: newNotificationRepository(tx, tracker),
-			Inbox:         NewInboxRepository(tx),
-		}
-		if err := fn(work); err != nil {
+		}); err != nil {
 			return err
 		}
 
-		// Drain what the repositories touched. Nothing external happens in here:
-		// no HTTP, no produce, no email, and no offset commit (§11.1 rule 2).
+		// Drain what the repository touched. Nothing external happens in here: no
+		// HTTP, no produce, no email, and no offset commit (§11.1 rule 2).
 		if events := tracker.drain(); len(events) > 0 {
 			envelopes, err := u.envelopes.From(events, meta)
 			if err != nil {
 				return err
 			}
-			if err := u.outbox(tx).Append(ctx, envelopes); err != nil {
+			if err := u.appender(tx).Append(ctx, envelopes); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		return false, err
+	}
+	return claimed, nil
 }
+
+func (u *UnitOfWork) claimer(q platformpg.Queryer) inboxClaimer {
+	return newInboxRepository(q)
+}
+
+func (u *UnitOfWork) appender(q platformpg.Queryer) outboxAppender {
+	return NewOutboxRepository(q)
+}
+
+var _ application.UnitOfWork = (*UnitOfWork)(nil)
 ```
+
+**No `outbox func(platformpg.Queryer) outboxAppender` field.** Accounts has one so a test can substitute a failing appender and assert "the outbox insert failed, so the user must not exist". That test is worth having here too, and it does not need the field: `u.envelopes.From` is an injectable failure point on the same code path two lines earlier, with identical rollback semantics — a `CloudEventFactory` whose `IDGen` fails on its second call proves "the drain failed, so the notification must not exist" exactly as well. The field would cost an indirect call and an allocation per record, forever, bought entirely with test money.
+
+This is a deliberate asymmetry with accounts' `uow.go`. Do not add the field back for symmetry, and do not refactor accounts in this plan — Plan 1 is committed and its field has a test depending on it.
 
 - [ ] **Step 9: Write the failing integration tests for the unit of work**
 
@@ -3041,30 +3120,35 @@ func (u *UnitOfWork) Do(ctx context.Context, meta application.Metadata, fn func(
 package postgres
 
 // The headline assertion of the whole plan, against a real database: process one
-// record and find three rows, in three tables, from one transaction — and the use
-// case asked for two of them.
-func TestUnitOfWork_OneRecordWritesInboxNotificationAndIntent(t *testing.T) { /* ... */ }
+// record and find three rows in three tables from one transaction — and the use
+// case asked for one of them.
+func TestUnitOfWork_OneRecordWritesInboxNotificationAndIntent(t *testing.T) { /* below */ }
 
-// The refusal. An appender that fails must leave neither the inbox row nor the
-// notification behind: "the send-intent insert failed, so the notification must
-// not exist." This is the dual-write problem, tested from the consuming side.
-func TestUnitOfWork_AFailedIntentInsertLeavesNothing(t *testing.T) { /* ... */ }
+// The refusal. A failed drain must leave neither the claim nor the notification
+// behind: "the send-intent insert failed, so the notification must not exist."
+// This is the dual-write problem, tested from the consuming side.
+func TestUnitOfWork_AFailedIntentInsertLeavesNothing(t *testing.T) { /* below */ }
 
 // The duplicate path, end to end through the transaction: the same event id twice
 // leaves one inbox row, one notification, and — the assertion that matters — one
 // send-intent. A second intent would be a second email.
-func TestUnitOfWork_ADuplicateLeavesTheOutboxUntouched(t *testing.T) { /* ... */ }
+func TestUnitOfWork_ADuplicateLeavesTheOutboxUntouched(t *testing.T) { /* below */ }
 
-// The intent row carries the inbound event id as its idempotency_key, which is
-// what makes §13's two remedies compose. Read the column, not the payload.
-func TestUnitOfWork_TheIntentCarriesTheInboundEventID(t *testing.T) { /* ... */ }
+// And the duplicate ran no work at all, which the boundary guarantees rather than
+// the use case: pass an fn that fails, and assert the transaction still commits and
+// reports not-claimed.
+func TestUnitOfWork_ADuplicateNeverCallsFn(t *testing.T) { /* below */ }
+
+// The intent row carries the inbound event id as its idempotency_key, which is what
+// makes §13's two remedies compose. Read the column, not the payload.
+func TestUnitOfWork_TheIntentCarriesTheInboundEventID(t *testing.T) { /* below */ }
 
 // The trace survives into the stored headers, so a registration and the email it
 // causes share a traceparent across two databases.
-func TestUnitOfWork_StoresTheTraceOnTheIntent(t *testing.T) { /* ... */ }
+func TestUnitOfWork_StoresTheTraceOnTheIntent(t *testing.T) { /* below */ }
 ```
 
-Write each body following `internal/accounts/infrastructure/postgres/uow_integration_test.go`: `pgtest.Notifications(t)`, `pgtest.Truncate(t, pool, "notifications.inbox", "notifications.notifications", "notifications.outbox")`, construct the real `UnitOfWork` with the real `CloudEventFactory` over `ids.System{}` (or the platform ids package's exported generator), run `ProcessUserRegistered.Execute` against it with a fixture record, then assert with `QueryRow` counts and column reads. For the failure case, replace `u.outbox` with a function returning a stub whose `Append` returns an error — that field exists for this test.
+Write each body following `internal/accounts/infrastructure/postgres/uow_integration_test.go`: `pgtest.Notifications(t)` (which truncates), construct the real `UnitOfWork` with the real `CloudEventFactory` over `ids.UUIDv7{}` and `clock.System{}`, run `ProcessUserRegistered.Execute` against it with a fixture record, then assert with `QueryRow` counts and column reads. For the failure case, hand the factory an `IDGen` that fails on its second call, so the notification insert succeeds and the drain does not.
 
 Add a `pgtest.CountNotifications(t, pool) (inbox, notifications, outbox int)` helper beside the existing `CountAccounts`, so the assertions read as three numbers rather than three queries.
 
@@ -3073,134 +3157,164 @@ Add a `pgtest.CountNotifications(t, pool) (inbox, notifications, outbox int)` he
 Run: `go test -tags=integration ./internal/notifications/... -v`
 Expected: PASS. Then `make lint && go test ./...` for the unit suite.
 
-- [ ] **Step 11: Prove the refusal test has teeth**
+- [ ] **Step 11: Prove the two refusals have teeth**
 
-In `uow.go`, temporarily move the `tracker.drain()` block *before* `fn(work)` so that it drains nothing and the append never runs. `TestUnitOfWork_AFailedIntentInsertLeavesNothing` must fail — if it passes, it is asserting the absence of rows that were never written for an unrelated reason. Restore.
+In `uow.go`, temporarily move the `tracker.drain()` block *before* the `fn(...)` call so it drains nothing and the append never runs. `TestUnitOfWork_AFailedIntentInsertLeavesNothing` must fail — if it passes, it is asserting the absence of rows that were never written for an unrelated reason. Restore.
+
+Then make `record` always return `true`. `TestUnitOfWork_ADuplicateLeavesTheOutboxUntouched` must fail with two of everything, and `TestUnitOfWork_ADuplicateNeverCallsFn` must fail too. Restore.
 
 - [ ] **Step 12: Commit**
 
 ```bash
 git add internal/notifications/infrastructure internal/platform/pgtest
-git commit -m "feat(notifications): three writes, one transaction, and the use case asked for two"
+git commit -m "feat(notifications): three writes, one transaction, and the use case asked for one"
 ```
 
 ---
 
-## Task 8: The consumer client
+## Task 8: The consumer client, and the record mapping
 
 **Files:**
-- Modify: `internal/platform/kafka/config.go`, `internal/platform/kafka/client.go`, `internal/platform/kafkatest/kafkatest.go`
-- Test: `internal/platform/kafka/config_test.go`, `client_integration_test.go`
+- Modify: `internal/platform/kafka/client.go`, `internal/platform/kafkatest/kafkatest.go`, `internal/accounts/infrastructure/kafka/publisher.go`
+- Test: `internal/platform/kafka/client_test.go`, `client_integration_test.go`
 
 **Interfaces:**
-- Produces: `ConsumerConfig{Brokers []string, Topics []string, GroupID string, OnRevoked func(context.Context, *kgo.Client, map[string][]int32)}`, `DefaultConsumerConfig(brokers []string, topics []string, group string) ConsumerConfig`, `NewConsumer(cfg ConsumerConfig) (*kgo.Client, error)`; `kafkatest.ConsumerGroup(t, brokers, topic) string`.
+- Produces: `NewConsumer(brokers, topics []string, group string) (*kgo.Client, error)`; `RecordToMessage(rec *kgo.Record) messaging.Message`; `RecordHeaders(msg messaging.Message) []kgo.RecordHeader` (accounts' `recordHeaders`, exported and moved); `kafkatest.ConsumerGroup(t) string`.
 
-Six options, each of which is a decision from §10.2. The config type exists so that they are set in one place and asserted in a test, rather than spread across `cmd/notifier`'s wiring where a future edit can quietly drop one.
+There is no `ConsumerConfig`. An earlier draft had one, reasoning from `ProducerConfig` — but `ProducerConfig` exists because it holds a real tunable with a real default (`RequestTimeoutOverhead`), and its own comment says it "holds only the producer's *values*". The consumer has no values: all six of §10.2's decisions are constants inside `NewConsumer`, which is already the "one place, asserted in one test" the config type was supposed to provide. What a struct would have added is a pass-through constructor, a `validate`, and a test asserting that a constructor copies its parameter.
 
-- [ ] **Step 1: Write the failing test**
+`RecordToMessage` lives here rather than in `notifications/infrastructure/kafka` for two reasons, and the second one is fatal to the alternative. Its signature names only `kgo.Record` and `messaging.Message`, so there is no context in it — the same argument accounts' `recordHeaders` makes about itself ("this function's entire job is the type change"). And `internal/arch`'s `TestPresentationAndInfrastructureAreSiblings` fails any `presentation` package that imports an `infrastructure` one, so a worker calling it from `notifications/infrastructure` would not build.
 
-`internal/platform/kafka/config_test.go` additions:
+- [ ] **Step 1: Write the failing tests for `NewConsumer`**
 
 ```go
-// Spec §10.2's option list, asserted. The two that matter most are the ones whose
-// absence is invisible until it costs a message.
-func TestDefaultConsumerConfig_MatchesTheSpec(t *testing.T) {
-	cfg := DefaultConsumerConfig([]string{"localhost:9092"},
-		[]string{"accounts.user.v1"}, "notifications.welcome-email")
-
-	if cfg.GroupID != "notifications.welcome-email" {
-		t.Errorf("GroupID = %q", cfg.GroupID)
-	}
-	if err := cfg.validate(); err != nil {
-		t.Errorf("the default config does not validate: %v", err)
-	}
-}
-
-func TestConsumerConfig_ValidateRefusesAnIncompleteConfig(t *testing.T) {
+func TestNewConsumer_RefusesAnIncompleteConfiguration(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		cfg  ConsumerConfig
+		name    string
+		brokers []string
+		topics  []string
+		group   string
 	}{
-		{name: "no brokers", cfg: ConsumerConfig{Topics: []string{"t"}, GroupID: "g"}},
-		{name: "no topics", cfg: ConsumerConfig{Brokers: []string{"b:9092"}, GroupID: "g"}},
+		{name: "no brokers", topics: []string{"t"}, group: "g"},
+		{name: "no topics", brokers: []string{"b:9092"}, group: "g"},
 		// A consumer with no group id is not a consumer group member: franz-go
 		// would happily consume without one, committing nothing and rejoining
 		// nothing, and the notifier would look like it worked until it restarted
-		// and reprocessed from the beginning.
-		{name: "no group", cfg: ConsumerConfig{Brokers: []string{"b:9092"}, Topics: []string{"t"}}},
+		// and reprocessed the topic from the beginning.
+		{name: "no group", brokers: []string{"b:9092"}, topics: []string{"t"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := tc.cfg.validate(); err == nil {
-				t.Error("validate accepted it")
+			if _, err := NewConsumer(tc.brokers, tc.topics, tc.group); err == nil {
+				t.Error("NewConsumer accepted it")
 			}
 		})
 	}
 }
+
+// The error names every missing field at once, for the reason LoadRelay joins its
+// problems: a process that fails one field per restart is a process someone debugs
+// three times.
+func TestNewConsumer_NamesEveryMissingField(t *testing.T) {
+	_, err := NewConsumer(nil, nil, "")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"brokers", "topics", "group"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
 ```
 
-And an integration test in `client_integration_test.go`:
+And in `client_integration_test.go`:
 
 ```go
 //go:build integration
 
-// The properties that cannot be asserted from a struct: that the client joins the
-// group, fetches from the beginning, and commits nothing on its own.
+// The property that cannot be asserted from a struct, and the one that matters
+// most: this client commits nothing on its own.
 //
-// The last one is the important one and the hardest to see. Produce three records,
-// consume them without committing, close the client, and open a second one in the
-// same group: it must receive all three again. An auto-commit ticker anywhere in
-// the configuration turns this test flaky first and lossy later.
-func TestNewConsumer_CommitsNothingOnItsOwn(t *testing.T) { /* ... */ }
+// Produce three records, consume them without committing, close the client, and
+// open a second one in the same group — it must receive all three again. An
+// auto-commit ticker anywhere in the configuration makes this test flaky first and
+// the system lossy later.
+func TestNewConsumer_CommitsNothingOnItsOwn(t *testing.T) {
+	broker := kafkatest.Broker(t)
+	topic := kafkatest.Topic(t, 1)
+	group := kafkatest.ConsumerGroup(t)
+	produce(t, broker, topic, 3)
 
-func TestNewConsumer_StartsAtTheBeginning(t *testing.T) { /* ... */ }
-```
+	first, err := NewConsumer([]string{broker}, []string{topic}, group)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	if got := pollN(t, first, 3); got != 3 {
+		t.Fatalf("first consumer got %d records, want 3", got)
+	}
+	first.Close() // no CommitRecords anywhere above
 
-- [ ] **Step 2: Run, fail, implement**
-
-Add to `internal/platform/kafka/config.go`:
-
-```go
-// ConsumerConfig is spec §10.2's option list as a value, so that the six
-// decisions it encodes live in one place and are asserted in one test rather than
-// spread through a process's wiring.
-type ConsumerConfig struct {
-	Brokers []string
-	Topics  []string
-
-	// GroupID is the consumer group. It is required and has no default: a
-	// consumer without a group commits nothing and rejoins nothing, which looks
-	// like it works until the first restart reprocesses the topic.
-	GroupID string
-
-	// OnRevoked runs when the group takes partitions away. §10.2: on revocation
-	// the notifier stops processing, does not commit offsets for records it has
-	// not finished, and lets the new owner redeliver them — the inbox absorbs the
-	// overlap. It is a field rather than a fixed callback because the behaviour is
-	// the worker's, and this package must not know what a notifier is.
-	OnRevoked func(context.Context, *kgo.Client, map[string][]int32)
+	second, err := NewConsumer([]string{broker}, []string{topic}, group)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	t.Cleanup(second.Close)
+	if got := pollN(t, second, 3); got != 3 {
+		t.Errorf("second consumer in group %s got %d records, want all 3 again — "+
+			"something committed an offset that no code asked to commit", group, got)
+	}
 }
 
-func DefaultConsumerConfig(brokers, topics []string, group string) ConsumerConfig {
-	return ConsumerConfig{Brokers: brokers, Topics: topics, GroupID: group}
-}
+// auto.offset.reset=earliest: a new group sees the whole topic. This demo's entire
+// subject is that nothing is lost, and a consumer starting at the end would lose
+// everything produced before it first ran.
+func TestNewConsumer_StartsAtTheBeginning(t *testing.T) {
+	broker := kafkatest.Broker(t)
+	topic := kafkatest.Topic(t, 1)
+	produce(t, broker, topic, 2) // produced *before* the consumer exists
 
-func (c ConsumerConfig) validate() error { /* joined errors, naming each field */ }
+	cl, err := NewConsumer([]string{broker}, []string{topic}, kafkatest.ConsumerGroup(t))
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	t.Cleanup(cl.Close)
+	if got := pollN(t, cl, 2); got != 2 {
+		t.Errorf("got %d records, want 2 — a fresh group did not start at the beginning", got)
+	}
+}
 ```
 
-And to `client.go`:
+`produce` and `pollN` are local test helpers: `produce` uses `kafkatest.Producer(t)` and `ProduceSync`; `pollN` calls `PollRecords` with a deadline context and counts, failing with what it saw. No sleeps (§15).
+
+- [ ] **Step 2: Run, fail, write `NewConsumer`**
 
 ```go
 // NewConsumer builds the consumer group member of spec §10.2. Every option below
 // is a decision, and three of them are the difference between at-least-once and
 // something worse.
-func NewConsumer(cfg ConsumerConfig) (*kgo.Client, error) {
-	if err := cfg.validate(); err != nil {
-		return nil, err
+//
+// There is no config struct. The consumer has no tunables — the six options are
+// all constants — so a struct would hold nothing but these three arguments, and
+// "set in one place, asserted in one test" is already what this function is.
+func NewConsumer(brokers, topics []string, group string) (*kgo.Client, error) {
+	var problems []error
+	if len(brokers) == 0 {
+		problems = append(problems, errors.New("kafka: consumer needs at least one of brokers"))
 	}
-	opts := []kgo.Opt{
-		kgo.SeedBrokers(cfg.Brokers...),
-		kgo.ConsumerGroup(cfg.GroupID),
-		kgo.ConsumeTopics(cfg.Topics...),
+	if len(topics) == 0 {
+		problems = append(problems, errors.New("kafka: consumer needs at least one of topics"))
+	}
+	if strings.TrimSpace(group) == "" {
+		problems = append(problems, errors.New("kafka: consumer needs a group id"))
+	}
+	if len(problems) > 0 {
+		return nil, errors.Join(problems...)
+	}
+
+	return kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topics...),
 
 		// The offset is committed after the database commit, by the worker, for
 		// the record it just processed. An automatic ticker would commit an offset
@@ -3214,154 +3328,39 @@ func NewConsumer(cfg ConsumerConfig) (*kgo.Client, error) {
 		// were rolled back.
 		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
 
-		// auto.offset.reset=earliest. A new group must see the whole topic: this
-		// is a demo whose entire subject is that nothing is lost, and a consumer
-		// that started at the end would lose everything produced before it first
-		// ran.
+		// auto.offset.reset=earliest, argued in the test above.
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
-	}
-	if cfg.OnRevoked != nil {
-		opts = append(opts, kgo.OnPartitionsRevoked(cfg.OnRevoked))
-	}
-	return kgo.NewClient(opts...)
+	)
 }
 ```
 
-- [ ] **Step 3: Add the test helper**
+**No `OnPartitionsRevoked`.** §10.2 sketches a `stopAndForget`, and there is nothing here for it to forget: Task 10's delivery ledger is keyed by partition and reset by offset, so a revoked partition's entry is overwritten rather than leaked. franz-go's default revocation behaviour is already §10.2's requirement — it commits nothing the worker did not commit, and the new owner redelivers from the last committed offset, which the inbox absorbs.
 
-`kafkatest.ConsumerGroup(t, brokers, topic) string` returns a unique group name per test (the existing `topicName(t)` shows the pattern) so that two integration tests in the same package do not share a group's committed offsets. Add it to `kafkatest` and nowhere else.
+- [ ] **Step 3: Move `RecordToMessage` and `recordHeaders` into this package**
 
-- [ ] **Step 4: Run everything**
-
-Run: `make lint && go test ./internal/platform/kafka/ -v && go test -tags=integration ./internal/platform/kafka/ -v`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add internal/platform/kafka internal/platform/kafkatest
-git commit -m "feat(kafka): the consumer group member, and the three options that make it at-least-once"
-```
-
----
-
-## Task 9: The Kafka adapters
-
-**Files:**
-- Create: `internal/notifications/infrastructure/kafka/consumer.go`, `dlt.go`
-- Test: `consumer_test.go`, `dlt_test.go`, `dlt_integration_test.go`
-
-**Interfaces:**
-- Produces: `RecordToMessage(rec *kgo.Record) messaging.Message`; `NewDeadLetterPublisher(client *kgo.Client, topic string) *DeadLetterPublisher` implementing `application.DeadLetterPublisher`.
-
-Two small adapters. The interesting one is the dead-letter publisher, because §12.2 specifies exactly what a DLT record must carry and the reason is recoverability: a record in the DLT has to be replayable onto the source topic without reconstruction.
-
-- [ ] **Step 1: Write the failing test for the record mapping**
-
-`internal/notifications/infrastructure/kafka/consumer_test.go`:
+`RecordToMessage` is new; `RecordHeaders` is `internal/accounts/infrastructure/kafka/publisher.go`'s `recordHeaders`, exported and moved, with its call site updated to `platformkafka.RecordHeaders`. Keep its sorted-key ordering and its comment.
 
 ```go
-// The mapping is the inbound half of the relay's publisher, and the fields it
-// reads are the ones §9.2 promises a consumer can route and deduplicate on
-// without deserialising the payload.
-func TestRecordToMessage_ReadsTheRoutingHeaders(t *testing.T) {
-	rec := &kgo.Record{
-		Topic:     "accounts.user.v1",
-		Partition: 2,
-		Offset:    17,
-		Key:       []byte("user-9f3c"),
-		Value:     []byte(`{"specversion":"1.0"}`),
-		Headers: []kgo.RecordHeader{
-			{Key: messaging.HeaderEventID, Value: []byte("0199a4f0-0000-7000-8000-00000000000c")},
-			{Key: messaging.HeaderEventType, Value: []byte("com.outboxexpress.accounts.user.registered")},
-			{Key: messaging.HeaderSchemaVersion, Value: []byte("1")},
-			{Key: messaging.HeaderCorrelationID, Value: []byte("corr-1")},
-		},
-	}
-
-	msg := RecordToMessage(rec)
-
-	if msg.EventID != "0199a4f0-0000-7000-8000-00000000000c" {
-		t.Errorf("EventID = %q", msg.EventID)
-	}
-	if msg.EventType != "com.outboxexpress.accounts.user.registered" {
-		t.Errorf("EventType = %q", msg.EventType)
-	}
-	if msg.SchemaVersion != 1 {
-		t.Errorf("SchemaVersion = %d, want 1", msg.SchemaVersion)
-	}
-	if msg.Partition != 2 || msg.Offset != 17 {
-		t.Errorf("coordinates = %d/%d, want 2/17", msg.Partition, msg.Offset)
-	}
-	if msg.Key != "user-9f3c" {
-		t.Errorf("Key = %q", msg.Key)
-	}
-	if msg.Headers[messaging.HeaderCorrelationID] != "corr-1" {
-		t.Errorf("headers = %v", msg.Headers)
-	}
-}
-
-// A record with no headers at all must map to a Message rather than panic. The
-// translator will reject it as permanent and the DLT will carry it, which is a
-// far better outcome than a crash loop on one malformed record — and a record
-// produced by something that is not our relay is exactly the case worth
-// surviving.
-func TestRecordToMessage_SurvivesAHeaderlessRecord(t *testing.T) {
-	msg := RecordToMessage(&kgo.Record{Topic: "accounts.user.v1", Value: []byte("{}")})
-	if msg.Topic != "accounts.user.v1" {
-		t.Errorf("Topic = %q", msg.Topic)
-	}
-	if msg.EventID != "" || msg.SchemaVersion != 0 {
-		t.Errorf("invented values from an empty header set: %+v", msg)
-	}
-}
-
-// An unparseable schema_version is zero rather than an error. The field is
-// informational for this consumer — nothing branches on it — and failing the whole
-// record over it would dead-letter a message whose payload is perfectly good.
-func TestRecordToMessage_AnUnparseableSchemaVersionIsZero(t *testing.T) {
-	rec := &kgo.Record{Topic: "t", Headers: []kgo.RecordHeader{
-		{Key: messaging.HeaderSchemaVersion, Value: []byte("one")},
-	}}
-	if got := RecordToMessage(rec).SchemaVersion; got != 0 {
-		t.Errorf("SchemaVersion = %d, want 0", got)
-	}
-}
-```
-
-- [ ] **Step 2: Run, fail, write `consumer.go`**
-
-```go
-// Package kafka is the notifications context's transport adapter: it turns Kafka
-// records into the shared transport Message, and dead-letters the ones that will
-// never succeed.
-//
-// It does not decide *when* to consume. The loop, the retry ladder and the offset
-// commit are the worker's, in presentation (spec §6.3): deciding when to run a use
-// case is a presentation concern, and an adapter that owned the loop would put
-// business sequencing in infrastructure.
-package kafka
-
 // RecordToMessage maps a fetched record onto the transport envelope.
 //
 // It reads the routing fields from *headers*, not from the payload, which is the
 // promise §9.2 makes to consumers: "a consumer can route and deduplicate without
-// deserialising". The payload stays opaque here and is parsed exactly once, in the
-// application layer's translator.
+// deserialising". The payload stays opaque here and is parsed exactly once, in a
+// context's own anti-corruption layer.
 //
-// Nothing in this function can fail. Every absent or malformed header yields a
-// zero value, and the reason is that the alternative is worse: a mapping that
-// errored would put a malformed record on the same path as a broken broker, and
-// the notifier's two paths for those are opposite — one dead-letters, one retries
-// forever. Deciding which is which is the translator's job, and it needs the
-// record in hand to do it.
+// Nothing in this function can fail, and the alternative is worse: a mapping that
+// errored would put a malformed record on the same path as a broken broker, and a
+// consumer's two responses to those are opposite — one dead-letters, one retries
+// forever. Deciding which is which needs the record in hand, so every absent or
+// malformed header yields a zero value and the decision is made a layer up.
 func RecordToMessage(rec *kgo.Record) messaging.Message {
 	headers := make(map[string]string, len(rec.Headers))
 	for _, h := range rec.Headers {
 		headers[h.Key] = string(h.Value)
 	}
-	// Parse errors are ignored deliberately; see the doc comment. strconv returns
-	// 0 on failure, which is the value an absent header would also give.
+	// Parse errors ignored deliberately; see above. strconv returns 0 on failure,
+	// which is what an absent header would also give, and nothing branches on the
+	// schema version.
 	version, _ := strconv.Atoi(headers[messaging.HeaderSchemaVersion])
 
 	return messaging.Message{
@@ -3374,26 +3373,54 @@ func RecordToMessage(rec *kgo.Record) messaging.Message {
 		Topic:         rec.Topic,
 		Partition:     rec.Partition,
 		Offset:        rec.Offset,
-		// Attempt is not set here. It is process-local bookkeeping the worker
-		// owns, and an adapter that guessed at it would be inventing a fact
-		// (§6.5).
 	}
 }
 ```
 
-- [ ] **Step 3: Write the failing tests for the dead-letter publisher**
+The header map costs one allocation and seven string copies per record to answer five lookups (three here, two in `metadataFrom`). A linear scan over `rec.Headers` would be cheaper, and it is not taken: the dead-letter path echoes the original headers verbatim, and the only way to give it them without handing a `*kgo.Record` to a transport-agnostic port is to carry the map. That is a priced trade, not a free choice — say so in the comment rather than presenting the map as obvious.
 
-The unit test asserts header composition against a fake produce; the integration test asserts the real record against a real broker.
+Its tests: the routing headers are read; a headerless record maps without panicking and invents nothing; an unparseable `schema_version` is zero. Write them as they were specified in the first draft of this plan, in `internal/platform/kafka/client_test.go`.
+
+- [ ] **Step 4: Add `kafkatest.ConsumerGroup(t)`**
+
+One argument, because `brokers` and `topic` cannot contribute to a group name — the uniqueness comes from `t.Name()`, and `topicName(t)` already does the Kafka-legal character mapping a group name needs. Reuse it.
+
+- [ ] **Step 5: Run everything**
+
+Run: `make lint && go test ./internal/platform/... ./internal/accounts/... -v && go test -tags=integration ./internal/platform/kafka/ -v`
+Expected: PASS. Accounts' publisher tests cover the moved `RecordHeaders`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/platform/kafka internal/platform/kafkatest internal/accounts/infrastructure/kafka
+git commit -m "feat(kafka): the consumer group member, and the record mapping where both contexts can reach it"
+```
+
+---
+
+## Task 9: The dead-letter publisher
+
+**Files:**
+- Create: `internal/notifications/infrastructure/kafka/dlt.go`
+- Test: `dlt_test.go`, `dlt_integration_test.go`
+
+**Interfaces:**
+- Produces: `NewDeadLetterPublisher(client *kgo.Client, topic string) *DeadLetterPublisher` implementing `application.DeadLetterPublisher`.
+
+One adapter, and §12.2 specifies exactly what it must write. The reason is recoverability: a record in the DLT has to be replayable onto the source topic without reconstruction (§12.3).
+
+- [ ] **Step 1: Write the failing tests**
 
 ```go
 // §12.2's header set, exactly: the original value and headers verbatim, plus six
-// dlt_* headers. Verbatim is the requirement that matters — a DLT record must be
-// replayable onto the source topic without reconstruction (§12.3), and a
-// publisher that dropped the original correlation id would break the trace of
-// every replayed message.
+// dlt_* headers. Verbatim is the requirement that matters — a publisher that
+// dropped the original correlation id would break the trace of every replayed
+// message.
 func TestDeadLetterPublisher_CarriesTheOriginalAndTheDiagnosis(t *testing.T) {
-	// original headers survive; ce_id, ce_type, correlation_id all present
-	// dlt_reason = "permanent", dlt_error contains the error text
+	// original ce_id, ce_type, correlation_id all present and unchanged
+	// value byte-identical to msg.Payload
+	// dlt_reason = "permanent"; dlt_error contains the error text
 	// dlt_deliveries = "3"
 	// dlt_original_topic / _partition / _offset name where it came from
 }
@@ -3404,58 +3431,56 @@ func TestDeadLetterPublisher_CarriesTheOriginalAndTheDiagnosis(t *testing.T) {
 func TestDeadLetterPublisher_PreservesThePartitionKey(t *testing.T) {}
 
 // Every error wraps ErrTransient. There is no permanent failure of dead-lettering
-// the notifier could act on: if the DLT is unreachable the right behaviour is to
+// the notifier could act on: if the DLT is unreachable, the right behaviour is to
 // stop making progress, not to drop the record.
 func TestDeadLetterPublisher_ErrorsAreTransient(t *testing.T) {}
+
+// A very long error is truncated rather than allowed to fail the produce. A DLT
+// produce that failed because the *diagnosis* was too big would lose the record it
+// was trying to save.
+func TestDeadLetterPublisher_TruncatesAnEnormousErrorText(t *testing.T) {}
 ```
 
-- [ ] **Step 4: Write `dlt.go`**
+The integration test asserts the same against a real broker, reading it back with `kafkatest.Records(t, dltTopic, 1)`.
+
+- [ ] **Step 2: Write `dlt.go`**
 
 ```go
-// The dlt_* header names of §12.2. Constants because a replay tool reads them and
-// a human greps for them, and a typo would be invisible until the day it mattered.
-const (
-	headerDLTReason          = "dlt_reason"
-	headerDLTError           = "dlt_error"
-	headerDLTDeliveries      = "dlt_deliveries"
-	headerDLTOriginalTopic   = "dlt_original_topic"
-	headerDLTOriginalPart    = "dlt_original_partition"
-	headerDLTOriginalOffset  = "dlt_original_offset"
-)
-
 // maxDLTErrorLength bounds the error text. Kafka's default max.message.bytes is
-// about a megabyte and an error string is normally a line, but "normally" is doing
+// about a megabyte and an error string is normally a line — but "normally" is doing
 // a lot of work in a header composed from an arbitrary error: a driver error
-// carrying a whole query, or an error chain built in a retry loop, can be large,
-// and a DLT produce that fails because the *diagnosis* was too big would lose the
-// record it was trying to save.
+// carrying a whole query, or an error chain built in a retry loop, can be large.
 const maxDLTErrorLength = 4096
 
-// DeadLetterPublisher produces the record that will never succeed to the
-// dead-letter topic, and waits for the durable ack.
+// DeadLetterPublisher produces a record that will never succeed to the dead-letter
+// topic, and waits for the durable ack.
 //
 // ProduceSync, not Produce: the offset is committed after this returns, so a
 // fire-and-forget DLT produce would forget where the record was before it was
 // durable anywhere else. §12.2: "the record is durable somewhere else before we
 // forget where it was."
+//
+// The dlt_* header names come from platform/messaging, beside the header names the
+// relay writes, because §12.3's replay tool reads them and is specified to have no
+// notifier dependency.
 type DeadLetterPublisher struct {
 	client *kgo.Client
 	topic  string
 }
 ```
 
-`Publish` builds `[]kgo.RecordHeader` from the original `msg.Headers` in sorted key order (deterministic, so a test can assert without sorting), appends the six `dlt_*` headers, sets `Key: []byte(msg.Key)` and `Value: msg.Payload`, calls `client.ProduceSync(ctx, rec).FirstErr()`, and wraps any error with `application.ErrTransient`.
+`Publish` starts from `platformkafka.RecordHeaders(msg)` — the same sorted-key conversion the relay's producer uses, which is where "verbatim" comes from — appends the six `dlt_*` headers using `messaging.HeaderDLT*`, sets `Key: []byte(msg.Key)` and `Value: msg.Payload`, calls `client.ProduceSync(ctx, rec).FirstErr()`, and wraps any error with `application.ErrTransient`.
 
-- [ ] **Step 5: Run everything**
+- [ ] **Step 3: Run everything**
 
 Run: `make lint && go test ./internal/notifications/... -v && go test -tags=integration ./internal/notifications/... -v`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add internal/notifications/infrastructure/kafka
-git commit -m "feat(notifications): the record mapping, and a dead letter you can replay"
+git commit -m "feat(notifications): a dead letter you can replay"
 ```
 
 ---
@@ -3467,77 +3492,97 @@ git commit -m "feat(notifications): the record mapping, and a dead letter you ca
 - Test: `internal/notifications/presentation/worker/notifier_test.go`
 
 **Interfaces:**
-- Consumes: `application.ProcessUserRegistered`, `application.DeadLetterPublisher`, `kafkainfra.RecordToMessage`.
-- Produces: `NotifierPolicy{RetryAttempts int, RetryBase time.Duration, MaxDeliveries int, DrainGrace time.Duration}`, `NewNotifier(client *kgo.Client, process Processor, dlt application.DeadLetterPublisher, log *slog.Logger, policy NotifierPolicy) *Notifier`, `(*Notifier).Run(ctx) error`.
+- Consumes: `application.ProcessUserRegistered`, `application.DeadLetterPublisher`, `application.Schedule`, `platformkafka.RecordToMessage`.
+- Produces: `NotifierPolicy{RetryAttempts, MaxDeliveries int, DrainGrace time.Duration}`, `NewNotifier(client *kgo.Client, process Processor, dlt application.DeadLetterPublisher, schedule application.Schedule, clk application.Clock, log *slog.Logger, policy NotifierPolicy) *Notifier`, `(*Notifier).Run(ctx) error`.
 
-The most decision-dense file in the plan. It owns four things: the ordering rule, the retry ladder, the delivery count, and the drain.
+The most decision-dense file in the plan. It owns five things: the ordering rule, the rewind, the retry ladder, the delivery count, and the drain.
 
-**The ordering rule.** Process the record, commit the transaction, then commit the offset. Never any other order. A crash between the second and the third causes redelivery, the inbox insert conflicts, the duplicate is skipped, and the offset is committed — "that is the design working" (§10.2). Committing the offset first would turn a crash into permanent loss.
+**The ordering rule.** Process the record, commit the transaction, then commit the offset. Never any other order. A crash between the second and the third causes redelivery, the inbox claim conflicts, the duplicate is skipped, and the offset is committed — "that is the design working" (§10.2). Committing the offset first would turn a crash into permanent loss.
 
-**The retry ladder (§12.2), in order.** Three in-process attempts at 50ms·2^n with jitter for a transient error, offset uncommitted. Then redelivery: return without committing, and Kafka hands the record back on the next poll cycle or after a rebalance. Then the dead-letter topic, on a permanent error or after `CONSUMER_MAX_DELIVERIES` deliveries.
+**The rewind, which is where the first draft of this plan was wrong.** Rung 2 of §12.2's ladder is "return without committing the offset; Kafka redelivers on the next poll cycle or after a rebalance". The second half of that sentence is true and the first half is not. franz-go hands a record out of `PollRecords` exactly once per session: its consume cursor has already advanced, so breaking out of the loop and polling again yields *later* offsets, not the failed one. Redelivery would happen only at the next rebalance or restart — and in the meantime the worker would process and commit a later record on the same partition, advancing the committed offset **past** the record it failed on. That is the loss the ordering rule exists to prevent, arriving through the back door.
 
-**The delivery count** is in-memory, keyed by `(topic, partition, offset)`, and resets on a rebalance or a restart (§6.5). It is a heuristic for "stop retrying this one", never a correctness input. It must be pruned on a successful commit and on revocation, or a long-running notifier's map grows without bound — a detail the spec does not mention and a reviewer would find.
+So a failed record must be rewound explicitly, and the notifier does it the simple way: **`PollRecords(ctx, 1)`**. One record at a time means a failure has exactly one partition and exactly one offset to put back, with `client.SetOffsets`, and there is never a "rest of the fetch" whose partitions would each need their own rewind bookkeeping. The cost is more `PollRecords` calls, and they are cheap: franz-go keeps fetched batches buffered in memory and serves them without a network round trip. For a reference implementation whose subject is that nothing is lost, one record per poll is also simply the honest expression of §10.2's "one record per transaction".
 
-**The drain.** Identical in shape and reason to the relay's `ce144d0`: on `SIGTERM`, stop fetching, but let the record in flight finish its transaction *and its offset commit*. The window here is smaller than the relay's and its cost is the same — a database commit whose offset was never committed is a redelivery, absorbed by the inbox but not free. §13.6 says it plainly: "`terminationGracePeriod` must exceed one poll-and-commit cycle so a rolling restart does not manufacture redeliveries."
+Note `SetOffsets`' own documented caveat — call it outside a poll and not concurrently with a commit. Both hold here: the worker is single-goroutine and the rewind happens between polls.
+
+**The retry ladder (§12.2), in order.** Three in-process attempts for a transient error, with the delay from `application.Schedule` — which is `platform/backoff`'s `Exponential` at a 50 ms base, not arithmetic written here. Then redelivery: rewind and stop, so the next poll hands the record back. Then the dead-letter topic, on a permanent error or after `CONSUMER_MAX_DELIVERIES` deliveries.
+
+Retry only what was classified transient. A permanent error must not be retried at all — §11.3's whole argument is that retrying a record that will never succeed is a way of never noticing it — and each retry re-runs the use case's pure prefix (a payload unmarshal, an entropy read, an aggregate). That prefix is deterministic and cheap, so re-running it on a genuine transient failure is the right trade against splitting the use case into prepare-and-commit halves; re-running it three times for a malformed record is not.
+
+**The delivery count** is in-memory, keyed by **`(topic, partition)`** with the offset in the value, and it is a heuristic for "stop retrying this one" — never a correctness input (§6.5). Keying it by offset as well is what an earlier draft did, and it needed pruning on success, pruning on dead-letter, pruning on revocation, an `OnPartitionsRevoked` callback to hang that on, and a test to bound the map. None of that is necessary: one member processes one partition in offset order, one record at a time, and a failure rewinds to the same offset — so at most one offset per partition can ever be in flight. An arriving record whose offset does not match the slot resets it. The map is then bounded by the partition assignment by construction, and §6.5's "that count resets on a rebalance or a restart" becomes true rather than aspirational.
+
+**The drain.** Identical in shape and reason to the relay's `ce144d0`: on `SIGTERM`, stop polling, but let the record in flight finish its transaction *and its offset commit*. §13.6 says it plainly: "`terminationGracePeriod` must exceed one poll-and-commit cycle so a rolling restart does not manufacture redeliveries."
 
 - [ ] **Step 1: Write the failing tests**
 
 ```go
-// The ordering rule, asserted as a sequence. This is the test that matters most in
-// the file: every other property could be wrong and the system would still be
-// correct-ish, while this one being wrong is silent, permanent data loss.
+// The ordering rule, asserted as a sequence. The most important test in the file:
+// every other property could be wrong and the system would still be correct-ish,
+// while this one being wrong is silent, permanent data loss.
 func TestNotifier_CommitsTheOffsetAfterTheTransaction(t *testing.T) {
 	// fake processor records "process"; fake committer records "commit"
 	// assert ops == ["process", "commit"]
 }
 
-// A transient failure retries in process, up to RetryAttempts, and then stops
-// without committing — so Kafka redelivers.
-func TestNotifier_RetriesTransientFailuresThenLeavesTheOffset(t *testing.T) {}
+// The rewind. A transient failure must put the partition's cursor back to the
+// failed record's offset, or the next poll returns a *later* record and committing
+// it advances past the one that failed.
+//
+// This is the test that would have caught the first draft of this plan. Assert the
+// rewind target explicitly: same topic, same partition, offset == the failed
+// record's offset.
+func TestNotifier_RewindsThePartitionAfterAFailedRecord(t *testing.T) {}
 
-// A permanent failure goes to the DLT *and then* commits, in that order, and does
-// not retry at all: retrying a record that will never succeed is a way of never
-// noticing it.
+// And the negative, which is the loss case stated directly: after a failure the
+// notifier must not commit any offset at all — not the failed record's, and not a
+// later one.
+func TestNotifier_CommitsNothingAfterAFailedRecord(t *testing.T) {}
+
+// A transient failure retries in process, up to RetryAttempts, taking its delay
+// from the Schedule port so the test needs no sleep.
+func TestNotifier_RetriesTransientFailuresBeforeGivingUp(t *testing.T) {}
+
+// A permanent failure is not retried at all, and its pure prefix runs once. Assert
+// the processor was called exactly once.
+func TestNotifier_DoesNotRetryAPermanentFailure(t *testing.T) {}
+
+// A permanent failure goes to the DLT *and then* commits, in that order.
 func TestNotifier_DeadLettersAPermanentFailureBeforeCommitting(t *testing.T) {}
 
-// The delivery ladder's top rung: the same record handed back MaxDeliveries times
-// is dead-lettered with dlt_reason=max_deliveries even though every failure was
-// transient. A transient error that never clears is a poison record wearing a
-// disguise.
+// The ladder's top rung: the same record handed back MaxDeliveries times is
+// dead-lettered with dlt_reason=max_deliveries even though every failure was
+// transient. A transient error that never clears is a poison record in disguise.
 func TestNotifier_DeadLettersAfterMaxDeliveries(t *testing.T) {}
 
-// And the count is per record, not global. Two records each failing twice must not
-// dead-letter either of them.
-func TestNotifier_TheDeliveryCountIsPerRecord(t *testing.T) {}
+// The count is per partition, not global. Two partitions each failing twice must
+// not dead-letter either record.
+func TestNotifier_TheDeliveryCountIsPerPartition(t *testing.T) {}
 
-// A failed DLT produce must not commit the offset. This is the one place where
-// giving up would be losing the record: the DLT is where a record goes to be
-// remembered, and forgetting where it was because we could not remember it
-// elsewhere is exactly backwards.
+// And it resets when the partition moves on, which is what makes the map bounded
+// without any pruning: a record at a new offset overwrites the slot.
+func TestNotifier_TheDeliveryCountResetsOnANewOffset(t *testing.T) {}
+
+// A failed DLT produce must not commit the offset. The one place where giving up
+// would be losing the record: the DLT is where a record goes to be remembered.
 func TestNotifier_AFailedDeadLetterDoesNotCommit(t *testing.T) {}
 
-// A duplicate commits the offset, because there is nothing left to do and the
-// partition must advance. A duplicate that declined to commit would redeliver
-// forever.
+// A duplicate commits the offset — there is nothing left to do and the partition
+// must advance. A duplicate that declined to commit would redeliver forever.
 func TestNotifier_ADuplicateCommitsTheOffset(t *testing.T) {}
 
-// An ignored record commits the offset too, and writes no inbox row (the use case
+// An ignored record commits the offset too, and wrote no inbox row (the use case
 // saw to that). The log line says ignored, which is how a reader finds out that
 // accounts has started publishing something new.
 func TestNotifier_AnIgnoredRecordCommitsTheOffset(t *testing.T) {}
 
-// The delivery map is pruned. A notifier that ran for a month would otherwise hold
-// one entry per record it ever processed.
-func TestNotifier_ForgetsRecordsItHasFinished(t *testing.T) {}
-
-// The drain, and the lesson of the relay's ce144d0: SIGTERM stops the fetching,
-// not the record in flight. Cancel ctx while a record is mid-transaction and
-// assert that its transaction *and* its offset commit both completed.
+// The drain, and the lesson of the relay's ce144d0: SIGTERM stops the polling, not
+// the record in flight. Cancel ctx mid-transaction and assert that both the
+// transaction and the offset commit completed.
 func TestNotifier_ShutdownLetsTheRecordInFlightCommitItsOffset(t *testing.T) {}
 
 // And the negative: a record that outlasts the grace is abandoned, loudly, with a
-// log line saying a redelivery is coming. Silence here would make a duplicate look
-// like a mystery.
+// line saying a redelivery is coming. Silence here makes a duplicate look like a
+// mystery.
 func TestNotifier_ARecordThatOutlastsTheGraceIsAbandonedLoudly(t *testing.T) {}
 ```
 
@@ -3548,7 +3593,7 @@ The loop, in the order the code should read:
 ```go
 func (n *Notifier) Run(ctx context.Context) error {
 	// Two contexts, and the difference between them is graceful shutdown: ctx
-	// means stop fetching new records, record means abandon the one in hand. The
+	// means stop polling for new records, work means abandon the one in hand. The
 	// same construction as the relay's, and the same argument — see
 	// (*Relay).draining and spec §11.2's "a SIGTERM is not a crash".
 	work, abandon := n.draining(ctx)
@@ -3559,36 +3604,50 @@ func (n *Notifier) Run(ctx context.Context) error {
 			n.stopping(work)
 			return nil
 		}
-		fetches := n.client.PollRecords(ctx, n.policy.PollMax)
-		if err := n.fetchErr(fetches); err != nil {
+
+		// One record per poll. Not a throughput choice — it is what makes the
+		// rewind below a single partition and a single offset instead of
+		// per-partition bookkeeping over an abandoned fetch. franz-go serves this
+		// from its in-memory buffer, so it is not a network round trip per record.
+		fetches := n.client.PollRecords(ctx, 1)
+		if err := fetches.Err0(); err != nil {
+			if ctx.Err() != nil {
+				n.stopping(work)
+				return nil
+			}
 			// A fetch error is not a record error. Log it and poll again; the
 			// client is already reconnecting underneath.
 			n.log.Warn("fetch failed", "error", err)
 			continue
 		}
-		for iter := fetches.RecordIter(); !iter.Done(); {
-			rec := iter.Next()
-			// One record, one transaction (§10.2). Batching would be faster and
-			// is the wrong default for a reference implementation: a single
-			// poison record would fail its whole batch, and partial progress
-			// could not be committed.
-			if err := n.handle(work, rec); err != nil {
-				// Nothing was committed. Stop consuming this fetch and let Kafka
-				// redeliver from the last committed offset — continuing would
-				// commit a later offset than one we failed on, which is the
-				// same loss as committing before the transaction.
-				n.log.Error("record not processed; leaving the offset for redelivery",
-					"error", err, "topic", rec.Topic,
-					"partition", rec.Partition, "offset", rec.Offset)
-				break
-			}
-			if work.Err() != nil {
-				// The grace expired mid-fetch. Stop cleanly rather than starting
-				// another transaction that cannot finish.
-				break
-			}
+
+		rec := firstRecord(fetches)
+		if rec == nil {
+			continue
+		}
+
+		if err := n.handle(work, rec); err != nil {
+			// Nothing was committed. Put the cursor back so the next poll hands
+			// this same record over again — franz-go has already advanced past it,
+			// and processing a later record on this partition would commit an
+			// offset beyond the one that failed.
+			n.rewind(rec)
+			n.log.Error("record not processed; rewound for redelivery",
+				"error", err, "topic", rec.Topic,
+				"partition", rec.Partition, "offset", rec.Offset)
 		}
 	}
+}
+
+// rewind puts one partition's consume cursor back to rec's offset.
+//
+// SetOffsets' documentation asks for two things: call it outside a poll, and not
+// concurrently with a commit. Both hold — the worker is one goroutine, and this
+// runs between polls, after handle has returned without committing.
+func (n *Notifier) rewind(rec *kgo.Record) {
+	n.client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
+		rec.Topic: {rec.Partition: {Epoch: rec.LeaderEpoch, Offset: rec.Offset}},
+	})
 }
 ```
 
@@ -3596,47 +3655,128 @@ func (n *Notifier) Run(ctx context.Context) error {
 
 ```go
 func (n *Notifier) handle(ctx context.Context, rec *kgo.Record) error {
-	msg := kafkainfra.RecordToMessage(rec)
-	key := coord{topic: rec.Topic, partition: rec.Partition, offset: rec.Offset}
-	msg.Attempt = n.deliveries.count(key)
+	msg := platformkafka.RecordToMessage(rec)
+	part := partition{topic: rec.Topic, partition: rec.Partition}
+	deliveries := n.deliveries.observe(part, rec.Offset) // 1 on first sight
 
-	res, err := n.processWithRetry(ctx, msg)
+	res, err := n.process(ctx, msg)
 	switch {
 	case err == nil:
 		// The transaction has committed. Only now is the offset safe to commit.
 		if err := n.client.CommitRecords(ctx, rec); err != nil {
 			return err
 		}
-		n.deliveries.forget(key)
 		n.logRecord(msg, res)
 		return nil
 
-	case errors.Is(err, application.ErrPermanent), msg.Attempt+1 >= n.policy.MaxDeliveries:
-		// The record is durable somewhere else before we forget where it was
-		// (§12.2).
-		reason := application.DeadLetterReason{
-			Reason:     reasonFor(err, msg.Attempt+1, n.policy.MaxDeliveries),
-			Err:        err.Error(),
-			Deliveries: msg.Attempt + 1,
-		}
-		if dltErr := n.dlt.Publish(ctx, msg, reason); dltErr != nil {
-			// Do not commit. The DLT is where a record goes to be remembered.
-			return errors.Join(err, dltErr)
-		}
-		if err := n.client.CommitRecords(ctx, rec); err != nil {
-			return err
-		}
-		n.deliveries.forget(key)
-		n.log.Error("record dead-lettered", "reason", reason.Reason, /* ... */)
-		return nil
+	case errors.Is(err, application.ErrPermanent):
+		return n.deadLetter(ctx, rec, msg, reasonPermanent, err, deliveries)
+
+	case deliveries >= n.policy.MaxDeliveries:
+		// A transient error that never clears is a poison record in disguise.
+		return n.deadLetter(ctx, rec, msg, reasonMaxDeliveries, err, deliveries)
 
 	default:
-		// Transient, and the in-process retries are spent. Count the delivery and
-		// return without committing: rung 2 of the ladder is Kafka's redelivery,
-		// and the count is what eventually escalates to rung 3.
-		n.deliveries.increment(key)
+		// Transient, and the in-process retries are spent. Return without
+		// committing; Run rewinds, and the count is what eventually escalates.
 		return err
 	}
+}
+
+// process runs the use case, retrying only what is worth retrying.
+//
+// A permanent error returns on the first attempt: retrying a record that will never
+// succeed is a way of never noticing it. A transient one is retried up to
+// RetryAttempts, with the delay from the Schedule port rather than arithmetic
+// written here — the formula is platform/backoff's, and injecting it is what lets a
+// test assert three attempts without waiting 350ms (§15).
+//
+// Each attempt re-runs the use case's pure prefix: one payload unmarshal, one
+// entropy read, one discarded aggregate. That is deliberate. The alternative is
+// splitting Execute into prepare-and-commit halves so the prefix runs once, which
+// buys back microseconds on a path that is already sleeping, in exchange for a
+// two-call use-case API and a Prepared value crossing the layer boundary.
+func (n *Notifier) process(ctx context.Context, msg messaging.Message) (application.ProcessResult, error) {
+	var res application.ProcessResult
+	var err error
+	for attempt := 0; attempt < n.policy.RetryAttempts; attempt++ {
+		if attempt > 0 {
+			if !n.wait(ctx, n.schedule.After(attempt-1)) {
+				return res, err // the grace expired; keep the last error
+			}
+		}
+		res, err = n.process.Execute(ctx, msg)
+		if err == nil || errors.Is(err, application.ErrPermanent) {
+			return res, err
+		}
+	}
+	return res, err
+}
+
+// deadLetter produces the record somewhere durable, then commits the offset. §12.2:
+// "the record is durable somewhere else before we forget where it was."
+func (n *Notifier) deadLetter(
+	ctx context.Context, rec *kgo.Record, msg messaging.Message,
+	reason string, cause error, deliveries int,
+) error {
+	dlr := application.DeadLetterReason{
+		Reason:     reason,
+		Err:        cause.Error(),
+		Deliveries: deliveries,
+	}
+	if err := n.dlt.Publish(ctx, msg, dlr); err != nil {
+		// Do not commit. The DLT is where a record goes to be remembered, and
+		// forgetting where it was because we could not remember it elsewhere is
+		// exactly backwards.
+		return errors.Join(cause, err)
+	}
+	if err := n.client.CommitRecords(ctx, rec); err != nil {
+		return err
+	}
+	n.log.Error("record dead-lettered", "reason", reason, "error", dlr.Err,
+		"deliveries", deliveries, "event_id", msg.EventID,
+		"partition", msg.Partition, "offset", msg.Offset)
+	return nil
+}
+```
+
+Two `reason` constants — `reasonPermanent = "permanent"`, `reasonMaxDeliveries = "max_deliveries"` — passed as literals from the two switch arms. An earlier draft merged those arms and then called a `reasonFor(err, attempt, max)` helper that re-tested both halves of the condition the switch had just evaluated, in order to recover which arm it was in. Two arms and two literals is the same code with the question asked once.
+
+The ledger:
+
+```go
+// partition is a ledger key. Not the offset — see observe.
+type partition struct {
+	topic     string
+	partition int32
+}
+
+// deliveries counts how many times the worker has been handed the *current*
+// record on each partition. No mutex: every call is on Run's goroutine, and a
+// comment saying so beats a lock nobody needs.
+type deliveries map[partition]*delivery
+
+type delivery struct {
+	offset int64
+	count  int
+}
+
+// observe records one more delivery of rec's offset and returns the running count.
+//
+// An arriving record whose offset differs from the slot resets it, and that is what
+// keeps this map bounded with no pruning anywhere: one member processes one
+// partition in offset order, one record at a time, and a failure rewinds to the
+// same offset — so at most one offset per partition can be in flight. The map is
+// bounded by the partition assignment, and a revoked partition's stale entry is
+// overwritten the first time its new owner hands us a record.
+func (d deliveries) observe(p partition, offset int64) int {
+	cur, ok := d[p]
+	if !ok || cur.offset != offset {
+		d[p] = &delivery{offset: offset, count: 1}
+		return 1
+	}
+	cur.count++
+	return cur.count
 }
 ```
 
@@ -3647,47 +3787,49 @@ func (n *Notifier) logRecord(msg messaging.Message, res application.ProcessResul
 	attrs := []any{
 		"event_id", msg.EventID, "event_type", msg.EventType,
 		"partition", msg.Partition, "offset", msg.Offset,
-		"recorded", res.Recorded, "duplicate", res.Duplicate,
+		"outcome", res.Outcome.String(),
 	}
-	switch {
-	case res.ConstraintCaught:
-		// The inbox did not stop this one; the UNIQUE constraint did. Both are
-		// correct and only one is expected, so this is the one duplicate that gets
-		// a WARN (§8.2, §12.3).
-		n.log.Warn("duplicate absorbed by source_event_id, not by the inbox; "+
-			"check inbox retention against broker retention", attrs...)
-	case res.Duplicate:
+	switch res.Outcome {
+	case application.OutcomeRecorded:
+		n.log.Info("record processed", append(attrs, "notification_id", res.NotificationID)...)
+	case application.OutcomeDuplicate:
 		// INFO, not WARN. A non-zero duplicate count is the inbox doing its job
 		// (§13.3), and logging it as a problem trains a reader to ignore it.
 		n.log.Info("duplicate absorbed", attrs...)
-	case res.Ignored:
+	case application.OutcomeIgnored:
 		n.log.Info("event type not handled by this consumer", attrs...)
-	default:
-		n.log.Info("record processed", append(attrs, "notification_id", res.NotificationID)...)
 	}
 }
 ```
 
-`deliveries` is a small type over `map[coord]int` — no mutex, because every call is on `Run`'s goroutine, and a comment saying so beats a mutex nobody needs. `draining` and `stopping` are copied from `internal/accounts/presentation/worker/relay.go`, comments included: **no logging from inside the `context.AfterFunc` callback** — `stop()` reports the callback has *started* and offers no way to join it, so a line from it can outlive `Run`. That bug was found by `-race` once already; do not reintroduce it.
+§13.3 asks for `duplicate` and `recorded` as fields, and this emits one `outcome` field instead. That is the same information without a pair of booleans that can disagree, and the switch is exhaustive over an enum rather than ordered over flags. Note the change in Task 14 so the spec and the code agree.
+
+`draining` and `stopping` are copied from `internal/accounts/presentation/worker/relay.go`, comments included: **no logging from inside the `context.AfterFunc` callback** — `stop()` reports the callback has *started* and offers no way to join it, so a line from it can outlive `Run`. That bug was found by `-race` once already; do not reintroduce it.
 
 - [ ] **Step 3: Prove the ordering test has teeth**
 
-Swap `CommitRecords` to before `processWithRetry`. `TestNotifier_CommitsTheOffsetAfterTheTransaction` must fail. Restore.
+Move `CommitRecords` to before `n.process`. `TestNotifier_CommitsTheOffsetAfterTheTransaction` must fail. Restore.
 
-- [ ] **Step 4: Prove the drain tests have teeth**
+- [ ] **Step 4: Prove the rewind tests have teeth**
+
+Delete the `n.rewind(rec)` call. `TestNotifier_RewindsThePartitionAfterAFailedRecord` must fail. Restore.
+
+This is the check that matters most in the whole plan, because the first draft shipped without the rewind and every other test still passed: the failed record's offset was simply never committed, which looks correct until a later record on the same partition commits past it.
+
+- [ ] **Step 5: Prove the drain tests have teeth**
 
 Replace `draining` with `func (n *Notifier) draining(ctx context.Context) (context.Context, context.CancelFunc) { return context.WithCancel(ctx) }`. Both drain tests must fail. Restore.
 
-- [ ] **Step 5: Run under the race detector**
+- [ ] **Step 6: Run under the race detector**
 
 Run: `go test -race ./internal/notifications/... -v`
 Expected: PASS with no race reports. If the detector fires on a log line, the callback is logging — fix the design, not the test.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add internal/notifications/presentation
-git commit -m "feat(notifier): the offset commits after the transaction, and the record in flight finishes"
+git commit -m "feat(notifier): the offset commits after the transaction, and a failed record is rewound"
 ```
 
 ---
@@ -3699,28 +3841,39 @@ git commit -m "feat(notifier): the offset commits after the transaction, and the
 - Test: `purge_inbox_test.go`, `inbox_purge_integration_test.go`
 
 **Interfaces:**
-- Produces: `InboxPurger` port with `PurgeProcessedBefore(ctx, before time.Time, limit int) (int, error)`; `PurgeInbox` use case; `NewPurger(purge, log, policy)`.
+- Produces: `InboxPurger` port with `PurgeProcessed(ctx context.Context, retention time.Duration, limit int) (int, error)`; `PurgeInbox` use case; `NewPurger(purge, log, policy)`.
+
+**Follow `internal/accounts/application/purge_published.go` and `internal/accounts/infrastructure/postgres/outbox_relay.go`'s `PurgePublished` exactly**, including the two things an earlier draft of this plan got wrong by inventing its own shape. The port takes a `retention time.Duration`, not a computed `before time.Time` — so there is no `Clock` in this use case, because the cutoff is `now() - make_interval(secs => $1)` in SQL. That is not a stylistic preference: PostgreSQL's `now()` is the transaction timestamp, so computing the cutoff in Go and passing it in makes the boundary depend on two clocks agreeing. `make_interval` is there because formatting a Go duration into PostgreSQL interval text is a conversion with no upside. Two purge jobs in one codebase with two port signatures, one Clock and two SQL idioms is a worse outcome than either shape alone.
 
 Mechanically the relay's purge job against a different table. What is different is what the retention *means*, and the doc comment has to say it: §13.2 — "Inbox retention is not storage hygiene — it is the boundary of the deduplication guarantee." A purged inbox row is an event this consumer will process again if it ever arrives again, and §12.3 records the incident that follows: reset the group to earliest and every event whose inbox row was purged is processed twice.
 
 That is why the default is 7 days rather than 24 hours, and why the guidance is `> broker_retention + max_replay_lag + max_outage_duration`.
 
-- [ ] **Step 1** Write the use case with a fake purger: it loops until a pass removes fewer rows than the limit, returns `PurgeResult{Deleted int, Passes int}`, and stops on a cancelled context without treating cancellation as a failure. Assert the loop terminates, that it respects the limit, and that `before` is computed from the injected clock minus the retention.
-- [ ] **Step 2** Write the SQL with the subquery bound, because PostgreSQL has no `DELETE … LIMIT`:
+- [ ] **Step 1** Write the use case as `purge_published.go`'s twin: it loops until a pass removes fewer rows than the limit, returns `PurgeResult{Deleted int, Passes int}`, and stops on a cancelled context without treating cancellation as a failure. Assert with a fake purger that the loop terminates, that it respects the limit, and that it passes the configured retention through unchanged.
+- [ ] **Step 2** Write the SQL. PostgreSQL has no `DELETE … LIMIT`, so the bound goes in a subquery — and the subquery returns `ctid`, not the primary key:
 
 ```sql
 DELETE FROM notifications.inbox
- WHERE (consumer, event_id) IN (
-    SELECT consumer, event_id FROM notifications.inbox
-     WHERE processed_at < $1
+ WHERE ctid IN (
+    SELECT ctid FROM notifications.inbox
+     WHERE processed_at < now() - make_interval(secs => $1)
      ORDER BY processed_at
      LIMIT $2
  )
 ```
 
-The `ORDER BY processed_at` matches `inbox_processed_at_idx` (created in migration 0001), so the bound page is found by an index walk rather than a sort of the whole table. Note the difference from accounts' purge: the key is composite, so the subquery selects two columns and the `IN` compares a row constructor.
+`ORDER BY processed_at` matches `inbox_processed_at_idx` from migration 0001, so the bound page is an index walk rather than a sort. The `ctid` is the part worth explaining, because the obvious version — selecting `(consumer, event_id)` and comparing a row constructor — is measurably worse here. Measured on PostgreSQL 18.6 with 300k rows and 150k eligible, one page of 1000:
 
-- [ ] **Step 3** Integration test: insert rows with `processed_at` spread across two weeks (pass explicit timestamps — do not rely on `now()`), purge with a 7-day retention, assert only the old ones are gone and that a second call deletes nothing.
+| Outer predicate | Buffers | Time |
+|---|---|---|
+| `(consumer, event_id) IN (…)` | 5023 shared hits | 6.75 ms |
+| `ctid IN (…)` | 2023 shared hits | 1.64 ms |
+
+The composite-key version spends 4000 of its 5023 hits on 1000 `inbox_pkey` lookups: the inner scan already located every row and reached its heap tuple, and the outer `DELETE` throws that away and buys it back by key. `ctid` is the identity it already had. 150k eligible rows is 150 pages, so this is ~600k redundant index searches per run, once a minute, for nothing.
+
+Accounts' purge pays the same shape at half the cost because its key is one column. That is worth a line in the comment: this table's composite key is why the two purges' SQL is not identical, and it is the only reason.
+
+- [ ] **Step 3** Integration test: insert rows with `processed_at` spread across two weeks (pass explicit timestamps), purge with a 7-day retention, assert only the old ones are gone and a second call deletes nothing. Also assert the empty case is cheap — the accounts purge added a partial index in migration `0002` specifically because "the index exists for the *empty* case", and here `inbox_processed_at_idx` already covers it (measured: 3 buffer hits, 0.036 ms on an empty eligible set), which is why this plan adds no migration.
 - [ ] **Step 4** The worker is a ticker calling the use case and logging one line per run, structurally the relay's `purger.go`. Copy it.
 - [ ] **Step 5** `make lint && go test -race ./internal/notifications/... && go test -tags=integration ./internal/notifications/...`
 - [ ] **Step 6** Commit: `feat(notifications): purge the inbox, and say what the retention actually bounds`
@@ -3734,7 +3887,7 @@ The `ORDER BY processed_at` matches `inbox_processed_at_idx` (created in migrati
 - Create: `cmd/notifier/main.go`
 
 **Interfaces:**
-- Produces: `config.LoadNotifier(getenv func(string) string) (NotifierConfig, error)` with `NotificationsDatabaseURL`, `KafkaBrokers`, `KafkaTopic`, `KafkaDLTTopic`, `KafkaGroupID`, `AdminAddr`, `LogLevel`, `MaxDeliveries`, `RetryAttempts`, `DrainGrace`, `InboxRetention`, `PurgeInterval`, `PurgeBatch`, `ChaosEnabled`.
+- Produces: `config.LoadNotifier(getenv func(string) string) (Notifier, error)` — `config.Notifier`, not `NotifierConfig`, because the package's existing types are `API`, `Migrate` and `Relay` and a lone `*Config` suffix would be the odd one out — with `NotificationsDatabaseURL`, `KafkaBrokers`, `KafkaTopic`, `KafkaDLTTopic`, `KafkaGroupID`, `AdminAddr`, `LogLevel`, `MaxDeliveries`, `RetryAttempts`, `DrainGrace`, `InboxRetention`, `PurgeInterval`, `PurgeBatch`, `ChaosEnabled`.
 
 §14's table is the specification; the existing `LoadRelay` is the shape. Every value validated at startup, every problem reported at once, and the error names the variable.
 
@@ -3770,7 +3923,9 @@ if cfg.InboxRetention < 24*time.Hour {
 
 - [ ] **Step 3: Write `cmd/notifier/main.go`**
 
-Following `cmd/relay/main.go`: load config, build the logger, open the *notifications* pool only, build the consumer client, wire the use case, start the admin listener and the two workers under an `errgroup`, and — the part that makes the drain mean anything — order every `defer` so that it runs after `g.Wait()`.
+Following `cmd/relay/main.go`: load config, build the logger, open the *notifications* pool only, build the consumer client with `platformkafka.NewConsumer`, wire the use case with `ids.UUIDv7{}` and `clock.System{}`, wire the retry schedule as `backoff.NewExponential(50*time.Millisecond, cfg.RetryCap)`, start the admin listener and the two workers under an `errgroup`, and — the part that makes the drain mean anything — order every `defer` so that it runs after `g.Wait()`.
+
+Readiness is not hand-rolled. `cmd/relay/main.go` and `cmd/api/main.go` both do it with the same two calls, and this is the third: `migrations.Ready(ctx, pool, migrations.Latest(migrations.Notifications))`. "Like the relay's" is how a codebase ends up with three different readiness queries; name the functions.
 
 ```go
 // Every defer below runs after g.Wait(), and therefore after the notifier's
@@ -3841,6 +3996,8 @@ That last assertion is what makes the demo honest. §13.3: the duplicate count i
 
 Process a record with a processor that commits the transaction and then returns an error before the offset commit — the crash window of §12.5's `crash-before-offset-commit`, without the chaos hook. Restart the notifier. Assert the record is redelivered, absorbed as a duplicate, and that the tables still hold exactly one of everything.
 
+This test double and §12.5's chaos hook inject the same fault by different means, and they must not diverge: when Plan 5 adds the `Chaos` port, this test should be rewritten to arm it rather than left as a second, drifting definition of the same window. Note that in Plan 5's plan.
+
 This is the test that would catch a broken implementation, and it is worth writing carefully: it is the only test in the project that proves the *ordering* rule end to end rather than through a fake committer.
 
 - [ ] **Step 4: A permanent failure reaches the DLT**
@@ -3865,27 +4022,35 @@ git commit -m "test(notifications): the duplicate path, proved rather than asser
 
 ---
 
-## Task 14: Documentation, and the spec's four corrections
+## Task 14: Documentation, and the spec's corrections
 
 **Files:**
 - Modify: `README.md`, `docs/superpowers/specs/2026-08-26-transactional-outbox-demo-design.md`, this plan
 - Test: none
 
-- [ ] **Step 1: Annotate §11.3 in the spec** with the four divergences this plan records — `msg.Metadata()`, `IDGen`'s error, the package qualifier, and the inbox-first ordering. Write them as corrections to the sketch, in the spec's own voice, the way §13.3's stats paragraph was corrected in `d7107ee`. A spec that keeps a sketch nobody implemented is a spec readers learn to distrust.
+- [ ] **Step 1: Annotate §11.3 in the spec** with the divergences this plan records — `msg.Metadata()`, `IDGen`'s error, the package qualifier, and the inbox claim moving into the unit of work. Write them as corrections to the sketch, in the spec's own voice, the way §13.3's stats paragraph was corrected in `d7107ee`. A spec that keeps a sketch nobody implemented is a spec readers learn to distrust.
 
-- [ ] **Step 2: Add `ErrNotForThisConsumer` to §12.2** as a third outcome beside transient and permanent, with the argument: a topic is a context's published language, not a queue for one consumer, and dead-lettering an event type this consumer does not want would flood the DLT on someone else's deployment.
+The fourth is the substantive one and deserves the most space: §11.3's sketch puts the inbox insert in the use case, which makes the design's headline ordering a property of a call site. §5/D4 already argues that such rules do not survive, and the boundary can enforce this one by construction.
 
-- [ ] **Step 3: Add the notifier to §14's `RELAY_DRAIN_GRACE` row**, and add the two new validations (`KAFKA_DLT_TOPIC ≠ KAFKA_TOPIC`, `INBOX_RETENTION ≥ 24h`) to §14's prose.
+- [ ] **Step 2: Correct §6.5's field list.** It specifies `Attempt` on the shared transport type. Add the argument against it: the field's only writer and only reader are two lines apart in one worker in one context, so it buys nothing and costs a paragraph on the wire contract explaining that one member of the wire contract is not part of the wire contract. The count travels to the dead-letter headers on the reason struct instead. §6.5's own case against a shared domain model is the case against it.
 
-- [ ] **Step 4: README.** The consuming half needs three things a reader cannot get from the code: what the notifier's log line means (`recorded`, `duplicate`, and why a non-zero duplicate count is good news); the guided duplicate demo, as commands to run and output to expect; and the honest limit — inbox retention is the boundary of the deduplication guarantee, so a group reset past it reprocesses, and that is a property of the design rather than a bug in it.
+There is **no** third error class to add to §12.2. An earlier draft of this plan proposed one for "an event type this consumer does not handle" and then found it was a predicate, not an error: it was constructed with `%w`, unwrapped three lines later, and converted into a non-error, while making the worker's classification switch three-valued for a case that must never reach it. §12.2's two classes stand unamended.
 
-- [ ] **Step 5: Append a post-implementation review section to this plan**, as Plan 2 did: what the code taught that the plan got wrong, and which of those generalise to Plan 4. Two candidates are already visible from here — whether `ConstraintCaught` survived contact with PostgreSQL's transaction-abort semantics (Task 6, Step 5), and whether the delivery-count map needed anything the plan did not anticipate.
+- [ ] **Step 3: Add the notifier to §14's `RELAY_DRAIN_GRACE` row**, add `CONSUMER_RETRY_CAP` if the schedule needs a cap variable, and add the two new validations (`KAFKA_DLT_TOPIC ≠ KAFKA_TOPIC`, `INBOX_RETENTION ≥ 24h`) to §14's prose.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 4: Correct §13.3's notifier line.** It asks for `duplicate` and `recorded` as separate fields; the implementation emits one `outcome` field, because the three outcomes are mutually exclusive and two booleans that can disagree are a worse contract than one enum. Same information, one field.
+
+- [ ] **Step 5: Correct §12.2 rung 2, which is wrong as written.** "Kafka redelivers on the next poll cycle" is not what happens: franz-go hands a record out once per session, so declining to commit does not rewind anything, and the worker would process a later record on the same partition and commit past the one that failed. Redelivery without a restart or a rebalance requires an explicit rewind. Say so, and say what the notifier does about it (`PollRecords(ctx, 1)` plus `SetOffsets`). This is the most consequential correction in the plan: the sentence as written describes silent data loss and reads like a description of at-least-once delivery.
+
+- [ ] **Step 6: README.** The consuming half needs three things a reader cannot get from the code: what the notifier's log line means (`outcome`, and why a stream of `duplicate` is good news); the guided duplicate demo, as commands to run and output to expect; and the honest limit — inbox retention is the boundary of the deduplication guarantee, so a group reset past it reprocesses, and that is a property of the design rather than a bug in it.
+
+- [ ] **Step 7: Append a post-implementation review section to this plan**, as Plan 2 did: what the code taught that the plan got wrong, and which of those generalise to Plan 4. Two candidates are visible from here — whether `SetOffsets` behaves as documented under a rebalance mid-rewind, and whether one-record polling costs anything measurable against the batch it replaced.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add README.md docs
-git commit -m "docs: the consuming half, and correct 11.3 where its sketch could not compile"
+git commit -m "docs: the consuming half, and correct 11.3, 12.2 and 6.5 where they were wrong"
 ```
 
 ---
@@ -3894,17 +4059,26 @@ git commit -m "docs: the consuming half, and correct 11.3 where its sketch could
 
 Run against the spec with fresh eyes, per the plan-writing checklist.
 
-**Spec coverage.** §6.5 → Task 1. §7's notifications column → Tasks 2, 3, 6. §8.2's tables → Tasks 3, 7 (the schema itself already exists in `migrations/notifications/0001_init.sql`; this plan adds no migration and needs none). §10.2 → Task 8, Task 10. §11.3 → Tasks 4, 5, 6, 7. §11.5 → Task 13. §12.2 → Task 10. §12.3's retention → Task 11. §13.2's inbox purge → Task 11. §13.3's notifier line → Task 10. §13.5's `:8083` → Task 12. §14's notifier variables → Task 12. §15's levels → distributed across every task, with the end-to-end invariant in Task 13.
+**Spec coverage.** §6.5 → Task 1 (with one field refused, and the refusal argued). §7's notifications column → Tasks 2, 3, 6. §8.2's tables → Tasks 3, 7 (the schema already exists in `migrations/notifications/0001_init.sql`; this plan adds no migration, verified by measuring the purge and the repositories against the indexes that are there). §10.2 → Tasks 8, 10. §11.3 → Tasks 4, 5, 6, 7. §11.5 → Task 13. §12.2 → Task 10, with rung 2 corrected. §12.3's retention → Task 11. §13.2's inbox purge → Task 11. §13.3's notifier line → Task 10. §13.5's `:8083` → Task 12. §14's notifier variables → Task 12. §15's levels → distributed across every task, with the end-to-end invariant in Task 13.
 
-**Deliberately out of scope**, and named so that a reader does not think they were forgotten:
+**Deliberately out of scope**, named so a reader does not think they were forgotten:
 
-- **§12.5's chaos hooks and the `Chaos` port.** They span all four processes and belong with the process that completes the set. Task 13 proves the same two windows with tests instead, which is what §12.5 says the hooks are: "the tests of §21 exposed as buttons."
-- **§13.4's readiness for group membership.** The notifier's `/readyz` should report whether the group is joined, and franz-go exposes that only indirectly. It goes with the admin surface work in Plan 5 rather than being half-done here; Task 12 wires `/healthz` and a pool-and-migration `/readyz` like the relay's.
-- **§12.3's `replay-dlt` command.** A separate tool with no notifier dependency.
-- **Everything the `sender` owns** — the email gateway, the `Idempotency-Key` call, `notifications.state='sent'`, the notifications outbox purge and its missing purge index. That is Plan 4. This plan writes the intent row and stops, which is exactly the seam §11.3 and §11.4 draw between them.
+- **§12.5's chaos hooks and the `Chaos` port.** They span all four processes and belong with the process that completes the set. Task 13 proves the same two windows with tests instead, which is what §12.5 says the hooks are: "the tests of §21 exposed as buttons." Task 13, Step 3 notes that the test double and the hook must not become two definitions of one fault.
+- **§13.4's readiness for group membership.** franz-go exposes it only indirectly; it goes with the admin surface work in Plan 5. Task 12 wires `/healthz` and a pool-and-migration `/readyz` using `migrations.Ready`, like the other two processes.
+- **§12.3's `replay-dlt` command.** A separate tool. Task 1 puts the `dlt_*` header names in `platform/messaging` so that it can read them without importing the notifier.
+- **Everything the `sender` owns** — the email gateway, the `Idempotency-Key` call, `notifications.state = 'sent'`, the notifications outbox purge and its missing purge index. That is Plan 4. This plan writes the intent row and stops, which is the seam §11.3 and §11.4 draw. Task 3's `repository.go` carries a specific instruction for it: add the transition-mediating repository method rather than going around `MarkSent` with a bare `UPDATE`, or the state machine ends up guarding nothing and §8.2's own complaint comes true from the inside.
 
-**Placeholder scan.** Four test bodies are specified by name, assertion list and the existing file to mirror rather than written out in full: Task 7's `uow_integration_test.go`, Task 8's two client integration tests, Task 9's three DLT tests, and Task 10's twelve notifier tests. That is a deliberate exception to "show the code", taken because each has a near-exact counterpart already committed in `internal/accounts` — and a plan that transcribes 600 lines of existing test scaffolding buries the twelve assertions that are actually new. Every one of them names its subject, its assertion and its argument; none says "test the above". If the implementer finds any of them underspecified, that is a plan bug and worth recording in the post-implementation section.
+**Placeholder scan.** Test bodies are specified by name, assertion list and argument rather than written out in four places: Task 7's `uow_integration_test.go`, Task 8's `RecordToMessage` tests, Task 9's four DLT tests, and Task 10's fifteen notifier tests. That is a deliberate exception to "show the code", taken because each has a near-exact counterpart already committed in `internal/accounts` — and a plan that transcribes 600 lines of existing test scaffolding buries the assertions that are actually new. Every one names its subject, its assertion and its reason; none says "test the above". If any turns out underspecified, that is a plan bug worth recording in the post-implementation section.
 
-**Type consistency.** `application.Metadata` is declared in Task 6 and used in Task 5; Task 5's interface block says so, and the two tasks must be done in order or the type moved. `Envelope.IdempotencyKey` (Task 5) is read by Task 7's `insertOutbox`. `ProcessResult`'s four booleans (Task 6) are read by Task 10's `logRecord`. `InboxRepository.Record`'s `(first bool, err error)` (Task 6) is implemented in Task 7 and no test asserts an error for a duplicate. `DeadLetterReason` (Task 4) is built in Task 10 and consumed in Task 9. `messaging.Message.Attempt` (Task 1) is written only in Task 10 and read only in Task 9's reason — nothing persists it, which is the property Task 1's comment demands.
+**Type consistency.** `application.Metadata` is declared in Task 6 and used in Task 5; Task 5's interface block says so, and the two must be done in order or the type moved. `Envelope.IdempotencyKey` (Task 5) is read by Task 7's `insertOutbox`. `Outcome` (Task 6) is switched on by Task 10's `logRecord`. `InboxClaim` (Task 6) is built by the use case, passed through `UnitOfWork.Do`, and consumed by Task 7's `inboxRepository.record`. `UnitOfWork.Do`'s `(claimed bool, err error)` is the one signature change from §11.3 that ripples: Task 6's fake, Task 7's real implementation and Task 7's integration tests all depend on it. `DeadLetterReason` (Task 4) is built in Task 10 and written in Task 9. `messaging.HeaderDLT*` and `messaging.SchemaBase` (Task 1) are read in Tasks 9 and 5 respectively. `application.Schedule` (Task 4) is implemented by `platform/backoff` and wired in Task 12.
 
-**One known conflict, resolved in the plan text.** Task 4's grep test forbids accounts' vocabulary outside `translate.go`; Task 5's `envelope.go` legitimately contains `user_id` in *this* context's published schema. Task 5, Step 3 says how to resolve it and why the forbidden list narrows to `com.outboxexpress.accounts` and `display_name` rather than exempting a second file.
+**What the first draft of this plan got wrong**, kept because the corrections are the interesting part and because two of them are patterns Plan 4 would have repeated:
+
+1. **Rung 2 of the retry ladder did not exist.** Declining to commit an offset does not rewind franz-go's cursor, so the failed record was never redelivered within the session and the next record on its partition would have committed *past* it. Silent loss, in the one design whose subject is that nothing is lost, and every other test still passed. Fixed with one-record polling and an explicit `SetOffsets`; Task 10, Step 4 checks the test has teeth. Plan 4's sender polls a table rather than a topic and does not inherit this — but it does inherit the lesson that "the framework will redeliver it" is a claim to verify against the framework, not from the shape of the API.
+2. **"Inbox first" was a comment in a call site.** The plan reproduced accounts' argument that such rules do not survive and then made an exception for the one rule this plan exists to demonstrate — with a test that admitted its own failure mode was silent. Moved into the transaction boundary, where the ordering is not expressible any other way.
+3. **`ConstraintCaught` was a state PostgreSQL cannot produce**, and the plan deferred deciding to a runtime observation. The deeper problem was the fake: a `fakeUOW` that keeps running after a repository error is more permissive than the database it stands for, and a test green against it guards nothing. Any fake modelling a transaction must refuse to continue after an error.
+4. **A four-boolean result for three mutually exclusive outcomes**, which made every assertion a conjunction and made `logRecord`'s branch order load-bearing.
+5. **`50ms · 2^n` written out** in a package whose sibling `platform/backoff` was written for this exact consumer and says so in its package doc, with the overflow already handled.
+6. **`presentation` importing `infrastructure`**, which `internal/arch` forbids — the record mapping belonged in `platform/kafka` all along, where it also stops duplicating accounts' `recordHeaders`.
+7. **A grep test that had to be weakened until it permitted most of what it forbade.** A text search cannot tell this context's `user_id` from accounts', so it asserts the one string that is unambiguous and says plainly that the rest is the doc comment's job.
+8. **Costs quoted without being counted**: a batch comment about round trips over a table that always appends one row, "a duplicate costs one round trip" for a path that costs three, a purge whose index claim covered the inner scan and not the join back, and a delivery map with an unbounded key.
