@@ -2868,12 +2868,11 @@ git commit -m "feat(messaging): shared CloudEvents 1.0 encoder and the accounts 
 ## Task 8: The connection pool and the outbox repository
 
 **Files:**
-- Create: `internal/platform/postgres/pool.go`
+- Create: `internal/platform/postgres/pool.go` (`queryer.go` and the package doc were written in Task 4)
 - Create: `internal/accounts/infrastructure/postgres/outbox_repo.go`
 - Test: `internal/platform/postgres/pool_test.go`
 - Test: `internal/platform/postgres/pool_integration_test.go` (`//go:build integration`)
 - Test: `internal/accounts/infrastructure/postgres/outbox_repo_integration_test.go` (`//go:build integration`)
-- Modify: `migrations/schema_integration_test.go` — add the `migrations.Ready` assertions
 
 **Interfaces:**
 - Consumes: `application.Envelope` (Task 6); `pgtest.Accounts` (Task 4).
