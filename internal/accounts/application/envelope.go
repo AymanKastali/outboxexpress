@@ -53,7 +53,7 @@ func (f CloudEventFactory) From(events []domain.Event, meta Metadata) ([]Envelop
 
 	envelopes := make([]Envelope, 0, len(events))
 	for _, event := range events {
-		data, schemaName, err := mapData(event)
+		data, schema, err := mapData(event)
 		if err != nil {
 			return nil, err
 		}
@@ -66,16 +66,21 @@ func (f CloudEventFactory) From(events []domain.Event, meta Metadata) ([]Envelop
 			return nil, fmt.Errorf("application: event id: %w", err)
 		}
 
-		occurred := event.OccurredAt().UTC()
+		// Read once each: the routing fields are needed twice below, and
+		// AggregateID formats a UUID every time it is called.
+		occurred := event.OccurredAt()
+		aggregateID := event.AggregateID()
+		eventType := event.EventType()
+
 		payload, err := messaging.EncodeCloudEvent(messaging.Attributes{
 			ID:          eventID.String(),
-			Type:        event.EventType(),
+			Type:        eventType,
 			Source:      source,
-			Subject:     event.AggregateID(),
+			Subject:     aggregateID,
 			Time:        occurred,
-			SchemaName:  schemaName,
+			SchemaName:  schema.name,
 			SchemaBase:  schemaBase,
-			Version:     event.SchemaVersion(),
+			Version:     schema.version,
 			Traceparent: meta.Traceparent,
 		}, data)
 		if err != nil {
@@ -85,9 +90,9 @@ func (f CloudEventFactory) From(events []domain.Event, meta Metadata) ([]Envelop
 		envelopes = append(envelopes, Envelope{
 			EventID:       eventID,
 			AggregateType: event.AggregateType(),
-			AggregateID:   event.AggregateID(),
-			EventType:     event.EventType(),
-			SchemaVersion: event.SchemaVersion(),
+			AggregateID:   aggregateID,
+			EventType:     eventType,
+			SchemaVersion: schema.version,
 			Payload:       payload,
 			Headers:       h,
 			OccurredAt:    occurred,
@@ -96,20 +101,29 @@ func (f CloudEventFactory) From(events []domain.Event, meta Metadata) ([]Envelop
 	return envelopes, nil
 }
 
+// messageSchema names one version of one message. Keeping the name and the
+// version in one value is what makes §9.3's dual-publish migration expressible:
+// mapData is the one place that decides both, so emitting the same state change
+// as two schema versions is a change here and nowhere else.
+type messageSchema struct {
+	name    string
+	version int
+}
+
 // mapData is the only context-specific part of the envelope: which domain event
-// becomes which `data` shape, and which schema names it.
-func mapData(event domain.Event) (any, string, error) {
+// becomes which `data` shape, and which schema — name and version — describes it.
+func mapData(event domain.Event) (any, messageSchema, error) {
 	switch e := event.(type) {
 	case domain.UserRegistered:
 		return userRegisteredData{
 			UserID:       e.UserID.String(),
-			Email:        e.Email,
-			DisplayName:  e.DisplayName,
+			Email:        e.Email.String(),
+			DisplayName:  e.DisplayName.String(),
 			Version:      e.Version,
 			RegisteredAt: e.RegisteredAt.UTC().Format(messaging.TimeFormat),
-		}, "accounts/user.registered", nil
+		}, messageSchema{name: "accounts/user.registered", version: 1}, nil
 	default:
-		return nil, "", fmt.Errorf("%w: %s (%T)", ErrUnmappedEvent, event.EventType(), event)
+		return nil, messageSchema{}, fmt.Errorf("%w: %s (%T)", ErrUnmappedEvent, event.EventType(), event)
 	}
 }
 

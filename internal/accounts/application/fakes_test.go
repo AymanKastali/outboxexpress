@@ -35,15 +35,15 @@ func (f *fakeUOW) Do(ctx context.Context, meta Metadata, fn func(Work) error) er
 }
 
 type fakeUserRepo struct {
-	inserted []*domain.User
-	err      error
+	saved []*domain.User
+	err   error
 }
 
-func (f *fakeUserRepo) Insert(ctx context.Context, u *domain.User) error {
+func (f *fakeUserRepo) Save(ctx context.Context, u *domain.User) error {
 	if f.err != nil {
 		return f.err
 	}
-	f.inserted = append(f.inserted, u)
+	f.saved = append(f.saved, u)
 	return nil
 }
 

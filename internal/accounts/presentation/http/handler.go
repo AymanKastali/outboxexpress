@@ -13,7 +13,14 @@ import (
 
 // maxBodyBytes is generous for two short strings and small enough that a
 // malicious body cannot make the process allocate.
-const maxBodyBytes = 8 << 10
+const (
+	maxBodyBytes = 8 << 10
+
+	// correlationUnavailable stands in when the id generator fails. It is a
+	// value, not the empty string, so the gap is visible in the outbox rather
+	// than absent from it.
+	correlationUnavailable = "correlation-id-unavailable"
+)
 
 // Registrar is what this handler needs, declared where it is needed. The use
 // case satisfies it without knowing this interface exists.
@@ -57,8 +64,9 @@ func (h *Handler) RegisterUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Location", "/users/"+res.UserID.String())
-	h.write(w, http.StatusCreated, registerResponse{UserID: res.UserID.String()})
+	userID := res.UserID.String()
+	w.Header().Set("Location", "/users/"+userID)
+	h.write(w, http.StatusCreated, registerResponse{UserID: userID})
 }
 
 // failFor is the whole error contract of this endpoint, in one place you can
@@ -79,16 +87,33 @@ func (h *Handler) failFor(w http.ResponseWriter, meta application.Metadata, err 
 }
 
 func (h *Handler) metadata(r *http.Request) application.Metadata {
-	correlation := r.Header.Get("X-Correlation-ID")
-	if correlation == "" {
-		if id, err := h.ids.New(); err == nil {
-			correlation = id.String()
-		}
-	}
 	return application.Metadata{
-		CorrelationID: correlation,
+		CorrelationID: h.correlationID(r),
 		Traceparent:   r.Header.Get("traceparent"),
 	}
+}
+
+// correlationID always returns one. A request that reaches the outbox without a
+// correlation id has broken the trace on the asynchronous hop, and done it
+// silently — the envelope simply omits the header (see headers() in the
+// application layer), so nothing downstream can tell a missing id from an
+// unrelated event.
+//
+// The generator can fail, so there is a fallback that cannot: UUIDv7 wants
+// entropy, and RFC 4122's nil UUID is a legitimate "no identifier" marker. A
+// literal sentinel is greppable in logs and distinguishable from a real id,
+// which an empty string is not.
+func (h *Handler) correlationID(r *http.Request) string {
+	if fromClient := r.Header.Get("X-Correlation-ID"); fromClient != "" {
+		return fromClient
+	}
+	id, err := h.ids.New()
+	if err != nil {
+		h.log.Warn("could not mint a correlation id; the trace will be marked, not lost",
+			"error", err)
+		return correlationUnavailable
+	}
+	return id.String()
 }
 
 func (h *Handler) fail(w http.ResponseWriter, status int, code, message string) {

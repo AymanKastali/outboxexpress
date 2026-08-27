@@ -25,7 +25,7 @@ func TestNotifier_DeliversToAListener(t *testing.T) {
 		t.Fatalf("LISTEN: %v", err)
 	}
 
-	n := NewNotifier(pool, ChannelOutboxNew, slog.New(slog.DiscardHandler))
+	n := NewNotifier(pool, slog.New(slog.DiscardHandler))
 	n.Notify(ctx)
 
 	notification, err := listener.Conn().WaitForNotification(ctx)
@@ -39,7 +39,7 @@ func TestNotifier_DeliversToAListener(t *testing.T) {
 
 func TestNotifier_SwallowsFailure(t *testing.T) {
 	_, pool := pgtest.Accounts(t)
-	n := NewNotifier(pool, ChannelOutboxNew, slog.New(slog.DiscardHandler))
+	n := NewNotifier(pool, slog.New(slog.DiscardHandler))
 
 	// A cancelled context makes the Exec fail. Notify must return quietly: a
 	// failed wakeup costs latency, and a registration that has already committed

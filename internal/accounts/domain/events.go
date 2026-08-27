@@ -8,20 +8,20 @@ import (
 
 // Event is what an aggregate emits when its state changes. Routing fields are
 // methods rather than payload data because the relay routes on them and must
-// never parse business content (spec §8.1).
+// never parse business content (spec §8.1): AggregateType selects the topic,
+// AggregateID becomes the partition key.
+//
+// There is deliberately no SchemaVersion here. A wire schema version is message
+// contract, not domain vocabulary — no domain expert has an opinion about it,
+// nothing routes on it, and one domain event type returning one fixed version
+// would make §9.3's dual-publish migration (one state change emitted as two
+// schema versions in a single transaction) inexpressible. The application layer
+// names the version alongside the schema it belongs to.
 type Event interface {
 	EventType() string
 	AggregateType() string
 	AggregateID() string
-	SchemaVersion() int
 	OccurredAt() time.Time
-}
-
-// EventSource is anything the unit of work can drain during a commit. Keeping
-// this in the domain is what lets the persistence layer collect events without
-// the domain knowing an outbox exists (spec §5, §6.4).
-type EventSource interface {
-	PullEvents() []Event
 }
 
 const (
@@ -39,8 +39,8 @@ const (
 // into accounts (event-carried state transfer, spec §9.1).
 type UserRegistered struct {
 	UserID       uuid.UUID
-	Email        string
-	DisplayName  string
+	Email        Email
+	DisplayName  DisplayName
 	Version      int
 	RegisteredAt time.Time
 }
@@ -48,5 +48,4 @@ type UserRegistered struct {
 func (e UserRegistered) EventType() string     { return EventTypeUserRegistered }
 func (e UserRegistered) AggregateType() string { return AggregateTypeUser }
 func (e UserRegistered) AggregateID() string   { return e.UserID.String() }
-func (e UserRegistered) SchemaVersion() int    { return 1 }
 func (e UserRegistered) OccurredAt() time.Time { return e.RegisteredAt }

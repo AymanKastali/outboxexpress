@@ -33,8 +33,8 @@ func newUserRepository(q platformpg.Queryer, tr *tracker) *userRepository {
 	return &userRepository{q: q, tracker: tr}
 }
 
-func (r *userRepository) Insert(ctx context.Context, u *domain.User) error {
-	_, err := r.q.Exec(ctx, insertUser, u.ID, u.Email, u.DisplayName, u.Version, u.CreatedAt)
+func (r *userRepository) Save(ctx context.Context, u *domain.User) error {
+	_, err := r.q.Exec(ctx, insertUser, u.ID(), u.Email().String(), u.DisplayName().String(), u.Version(), u.CreatedAt())
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) &&
@@ -43,9 +43,9 @@ func (r *userRepository) Insert(ctx context.Context, u *domain.User) error {
 			// The domain owns the rule; the database is where it can actually be
 			// enforced under concurrency. Translating here keeps the rule's
 			// vocabulary in the domain and its enforcement where it belongs.
-			return fmt.Errorf("%w: %s", domain.ErrEmailTaken, u.Email)
+			return fmt.Errorf("%w: %s", domain.ErrEmailTaken, u.Email())
 		}
-		return fmt.Errorf("postgres: insert user %s: %w", u.ID, err)
+		return fmt.Errorf("postgres: save user %s: %w", u.ID(), err)
 	}
 	// Only after a successful write. The unit of work will drain this aggregate's
 	// events into the outbox inside the same transaction.

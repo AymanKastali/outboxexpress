@@ -14,6 +14,7 @@ import (
 
 	"github.com/AymanKastali/outboxexpress/internal/accounts/application"
 	"github.com/AymanKastali/outboxexpress/internal/accounts/domain"
+	"github.com/AymanKastali/outboxexpress/internal/platform/admin"
 )
 
 var handlerUserID = uuid.MustParse("9f3c1e6a-4b2d-4f8a-9c11-77a2e0d3b5f1")
@@ -43,7 +44,7 @@ func serve(t *testing.T, reg Registrar, req *http.Request) *httptest.ResponseRec
 	t.Helper()
 	h := NewHandler(reg, staticIDs{}, slog.New(slog.DiscardHandler))
 	rec := httptest.NewRecorder()
-	NewRouter(h).ServeHTTP(rec, req)
+	NewRouter(h, admin.Healthz()).ServeHTTP(rec, req)
 	return rec
 }
 
@@ -66,9 +67,7 @@ func TestRegisterUser_Created(t *testing.T) {
 	if got := rec.Header().Get("Content-Type"); got != "application/json" {
 		t.Errorf("Content-Type = %q", got)
 	}
-	var body struct {
-		UserID string `json:"user_id"`
-	}
+	var body registerResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -161,10 +160,7 @@ func assertError(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int, w
 	if rec.Code != wantStatus {
 		t.Fatalf("status = %d, want %d; body: %s", rec.Code, wantStatus, rec.Body.String())
 	}
-	var body struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
+	var body errorResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal %q: %v", rec.Body.String(), err)
 	}
@@ -198,3 +194,27 @@ func TestRouter_MethodAndRoute(t *testing.T) {
 		t.Errorf("GET /nope = %d, want 404", rec.Code)
 	}
 }
+
+// A request always gets a correlation id, even when the generator fails. The
+// alternative — an empty one — loses the trace on exactly the asynchronous hop
+// this project exists to demonstrate, and loses it silently.
+func TestHandler_CorrelationIDSurvivesAFailingGenerator(t *testing.T) {
+	reg := &fakeRegistrar{}
+	h := NewHandler(reg, failingIDs{}, slog.New(slog.DiscardHandler))
+	rec := httptest.NewRecorder()
+	NewRouter(h, admin.Healthz()).ServeHTTP(rec, postUsers(`{"email":"ada@example.com","display_name":"Ada Lovelace"}`))
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Correlation-Id"); got == "" {
+		t.Error("X-Correlation-Id is empty when the id generator fails")
+	}
+	if reg.lastCmd.Meta.CorrelationID == "" {
+		t.Error("the envelope would carry no correlation_id, so the trace stops at the outbox")
+	}
+}
+
+type failingIDs struct{}
+
+func (failingIDs) New() (uuid.UUID, error) { return uuid.Nil, errors.New("no entropy") }

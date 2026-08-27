@@ -50,7 +50,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := platformpg.NewPool(ctx, cfg.AccountsDatabaseURL, maxDBConns)
+	pool, err := platformpg.NewPool(ctx, platformpg.DefaultPoolConfig(cfg.AccountsDatabaseURL, maxDBConns))
 	if err != nil {
 		return err
 	}
@@ -66,16 +66,17 @@ func run() error {
 	generator := ids.UUIDv7{}
 	envelopes := application.NewCloudEventFactory(generator)
 	uow := accountspg.NewUnitOfWork(pool, envelopes)
-	notifier := wakeup.NewNotifier(pool, wakeup.ChannelOutboxNew, log)
+	notifier := wakeup.NewNotifier(pool, log)
 	registerUser := application.NewRegisterUser(uow, clock.System{}, generator, notifier)
 	handler := httpapi.NewHandler(registerUser, generator, log)
 
-	publicMux := httpapi.NewRouter(handler)
-	publicMux.Handle("GET /healthz", admin.Healthz()) // spec §13.5, one implementation
+	// admin.Healthz is passed to both listeners: one implementation, two mounts
+	// (spec §13.5).
+	health := admin.Healthz()
 
 	public := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           publicMux,
+		Handler:           httpapi.NewRouter(handler, health),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

@@ -21,13 +21,16 @@ import (
 const ChannelOutboxNew = "outbox_new"
 
 type Notifier struct {
-	pool    *pgxpool.Pool
-	channel string
-	log     *slog.Logger
+	pool *pgxpool.Pool
+	log  *slog.Logger
 }
 
-func NewNotifier(pool *pgxpool.Pool, channel string, log *slog.Logger) *Notifier {
-	return &Notifier{pool: pool, channel: channel, log: log}
+// NewNotifier takes no channel. There is one channel, ChannelOutboxNew, declared
+// above; a parameter with one possible argument advertises flexibility that does
+// not exist, and every call site passing the same constant is that parameter
+// admitting it.
+func NewNotifier(pool *pgxpool.Pool, log *slog.Logger) *Notifier {
+	return &Notifier{pool: pool, log: log}
 }
 
 // Notify fires pg_notify outside any transaction. It is called after the commit
@@ -35,12 +38,13 @@ func NewNotifier(pool *pgxpool.Pool, channel string, log *slog.Logger) *Notifier
 // anyway, and holding the intent inside the business transaction would tie the
 // write path to the notify queue's health.
 //
-// pg_notify is used rather than NOTIFY because the channel name is a parameter,
-// and NOTIFY takes only a literal.
+// pg_notify is used rather than NOTIFY because it takes the channel as a bind
+// parameter; NOTIFY accepts only a literal, which would mean interpolating the
+// constant into the SQL string.
 func (n *Notifier) Notify(ctx context.Context) {
-	if _, err := n.pool.Exec(ctx, `SELECT pg_notify($1, '')`, n.channel); err != nil {
+	if _, err := n.pool.Exec(ctx, `SELECT pg_notify($1, '')`, ChannelOutboxNew); err != nil {
 		n.log.Warn("outbox wakeup failed; the relay will find the row by polling",
-			"channel", n.channel, "error", err)
+			"channel", ChannelOutboxNew, "error", err)
 	}
 }
 

@@ -31,12 +31,12 @@ func TestTracker_DrainsInTrackingOrder(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("len(events) = %d, want 2", len(events))
 	}
-	if events[0].AggregateID() != a.ID.String() {
+	if events[0].AggregateID() != a.ID().String() {
 		t.Errorf("first event is %s, want %s — tracking order is publish order",
-			events[0].AggregateID(), a.ID)
+			events[0].AggregateID(), a.ID())
 	}
-	if events[1].AggregateID() != b.ID.String() {
-		t.Errorf("second event is %s, want %s", events[1].AggregateID(), b.ID)
+	if events[1].AggregateID() != b.ID().String() {
+		t.Errorf("second event is %s, want %s", events[1].AggregateID(), b.ID())
 	}
 }
 

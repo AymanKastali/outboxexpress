@@ -22,6 +22,16 @@ import (
 // The cost is that the two inserts are no longer adjacent in the code a reader
 // follows. That is why this file is short, and why Task 10's tests assert the
 // invariant directly rather than trusting it.
+// outboxAppender is the append role, declared at its consumer. It is not in
+// application/ports.go because no use case mentions an outbox — that is the
+// whole point of spec §5, and an interface exported from application that
+// nothing in application uses invites exactly the reach-in that ports.go warns
+// about for Work. The relay's claim/mark/fail role (Plan 2) is a different port
+// with a real application consumer, and gets declared there.
+type outboxAppender interface {
+	Append(ctx context.Context, envelopes []application.Envelope) error
+}
+
 type UnitOfWork struct {
 	pool      *pgxpool.Pool
 	envelopes application.EnvelopeFactory
@@ -32,14 +42,20 @@ type UnitOfWork struct {
 	// exist" is the dual-write refusal in its purest form, and there is no way
 	// to provoke it from outside — the factory mints a fresh UUIDv7 per event,
 	// so not even the event_id constraint can be made to fire.
-	outbox func(platformpg.Queryer) application.OutboxAppender
+	//
+	// This is not the thing platform/clock declines to ship. That is about an
+	// exported, wireable hook that a binary could reach; this is an unexported
+	// field with no setter, invisible outside the package and unreachable from
+	// any process's wiring. The seam a test needs and the seam a caller could
+	// misuse are different seams.
+	outbox func(platformpg.Queryer) outboxAppender
 }
 
 func NewUnitOfWork(pool *pgxpool.Pool, envelopes application.EnvelopeFactory) *UnitOfWork {
 	return &UnitOfWork{
 		pool:      pool,
 		envelopes: envelopes,
-		outbox: func(q platformpg.Queryer) application.OutboxAppender {
+		outbox: func(q platformpg.Queryer) outboxAppender {
 			return NewOutboxRepository(q)
 		},
 	}

@@ -3,10 +3,17 @@ CREATE SCHEMA accounts;
 
 CREATE TABLE accounts.users (
     id            UUID        PRIMARY KEY,
-    email         TEXT        NOT NULL UNIQUE,
+    email         TEXT        NOT NULL,
     display_name  TEXT        NOT NULL,
     version       INTEGER     NOT NULL DEFAULT 1,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Named, not inline: the repository translates this constraint's violation
+    -- into domain.ErrEmailTaken by matching the name, so the name is part of
+    -- the contract between the schema and the adapter. "users_email_key" is
+    -- what PostgreSQL generates for an inline UNIQUE anyway, so writing it out
+    -- changes nothing except who is on record as having chosen it.
+    CONSTRAINT users_email_key UNIQUE (email)
 );
 
 CREATE TABLE accounts.outbox (

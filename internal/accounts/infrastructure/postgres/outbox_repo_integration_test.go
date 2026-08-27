@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/AymanKastali/outboxexpress/internal/accounts/application"
+	"github.com/AymanKastali/outboxexpress/internal/accounts/domain"
 	"github.com/AymanKastali/outboxexpress/internal/platform/pgtest"
 )
 
@@ -23,9 +24,9 @@ func envelope(t *testing.T, aggregateID string, payload string) application.Enve
 	}
 	return application.Envelope{
 		EventID:       id,
-		AggregateType: "User",
+		AggregateType: domain.AggregateTypeUser,
 		AggregateID:   aggregateID,
-		EventType:     "com.outboxexpress.accounts.user.registered",
+		EventType:     domain.EventTypeUserRegistered,
 		SchemaVersion: 1,
 		Payload:       []byte(payload),
 		Headers:       map[string]string{"correlation_id": "corr-1"},

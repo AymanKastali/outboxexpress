@@ -45,7 +45,7 @@ func (uc *RegisterUser) Execute(ctx context.Context, cmd RegisterUserCommand) (R
 	}
 
 	if err := uc.uow.Do(ctx, cmd.Meta, func(w Work) error {
-		return w.Users.Insert(ctx, user) // ErrEmailTaken surfaces here
+		return w.Users.Save(ctx, user) // ErrEmailTaken surfaces here
 	}); err != nil {
 		return RegisterUserResult{}, err // <- the atomic moment
 	}
@@ -54,5 +54,5 @@ func (uc *RegisterUser) Execute(ctx context.Context, cmd RegisterUserCommand) (R
 	// costs latency and nothing else, because the poll loop is authoritative.
 	uc.wakeup.Notify(ctx)
 
-	return RegisterUserResult{UserID: user.ID}, nil
+	return RegisterUserResult{UserID: user.ID()}, nil
 }

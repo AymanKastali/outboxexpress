@@ -2,7 +2,6 @@ package domain
 
 import (
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -19,17 +18,17 @@ func TestRegister_NormalisesEmailAndTrimsName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if u.Email != "ada@example.com" {
-		t.Errorf("Email = %q, want %q", u.Email, "ada@example.com")
+	if u.Email().String() != "ada@example.com" {
+		t.Errorf("Email = %q, want %q", u.Email(), "ada@example.com")
 	}
-	if u.DisplayName != "Ada Lovelace" {
-		t.Errorf("DisplayName = %q, want %q", u.DisplayName, "Ada Lovelace")
+	if u.DisplayName().String() != "Ada Lovelace" {
+		t.Errorf("DisplayName = %q, want %q", u.DisplayName(), "Ada Lovelace")
 	}
-	if u.Version != 1 {
-		t.Errorf("Version = %d, want 1", u.Version)
+	if u.Version() != 1 {
+		t.Errorf("Version = %d, want 1", u.Version())
 	}
-	if !u.CreatedAt.Equal(testNow) {
-		t.Errorf("CreatedAt = %v, want %v", u.CreatedAt, testNow)
+	if !u.CreatedAt().Equal(testNow) {
+		t.Errorf("CreatedAt = %v, want %v", u.CreatedAt(), testNow)
 	}
 }
 
@@ -48,8 +47,8 @@ func TestRegister_EmitsExactlyOneEvent(t *testing.T) {
 	}
 	want := UserRegistered{
 		UserID:       testID,
-		Email:        "ada@example.com",
-		DisplayName:  "Ada Lovelace",
+		Email:        mustEmail(t, "ada@example.com"),
+		DisplayName:  mustName(t, "Ada Lovelace"),
 		Version:      1,
 		RegisteredAt: testNow,
 	}
@@ -69,25 +68,8 @@ func TestUserRegistered_RoutingFields(t *testing.T) {
 	if e.AggregateID() != testID.String() {
 		t.Errorf("AggregateID = %q, want %q", e.AggregateID(), testID)
 	}
-	if e.SchemaVersion() != 1 {
-		t.Errorf("SchemaVersion = %d, want 1", e.SchemaVersion())
-	}
 	if !e.OccurredAt().Equal(testNow) {
 		t.Errorf("OccurredAt = %v, want %v", e.OccurredAt(), testNow)
-	}
-}
-
-func TestPullEvents_DrainsOnce(t *testing.T) {
-	u, err := Register(testID, "ada@example.com", "Ada Lovelace", testNow)
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	if got := len(u.PullEvents()); got != 1 {
-		t.Fatalf("first pull = %d events, want 1", got)
-	}
-	if got := len(u.PullEvents()); got != 0 {
-		t.Fatalf("second pull = %d events, want 0 — a drained aggregate must not "+
-			"re-emit, or one commit would append the same outbox row twice", got)
 	}
 }
 
@@ -99,16 +81,13 @@ func TestRegister_Rejects(t *testing.T) {
 		displayName string
 		want        error
 	}{
-		{"empty email", testID, "", "Ada", ErrInvalidEmail},
-		{"blank email", testID, "   ", "Ada", ErrInvalidEmail},
-		{"no at sign", testID, "ada.example.com", "Ada", ErrInvalidEmail},
-		{"no domain", testID, "ada@", "Ada", ErrInvalidEmail},
-		{"no local part", testID, "@example.com", "Ada", ErrInvalidEmail},
-		{"display name form", testID, "Ada <ada@example.com>", "Ada", ErrInvalidEmail},
-		{"two addresses", testID, "a@b.com, c@d.com", "Ada", ErrInvalidEmail},
-		{"empty display name", testID, "ada@example.com", "", ErrInvalidDisplayName},
-		{"blank display name", testID, "ada@example.com", "   ", ErrInvalidDisplayName},
-		{"nil id", uuid.Nil, "ada@example.com", "Ada", ErrInvalidID},
+		// One row per rule Register owns. What makes an address or a name
+		// invalid is enumerated by the types that decide it, in email_test.go
+		// and display_name_test.go; repeating those tables here would mean a
+		// new rule has to be added in two places.
+		{"a bad email is the type's refusal, passed through", testID, "not-an-address", "Ada", ErrInvalidEmail},
+		{"a bad display name likewise", testID, "ada@example.com", "   ", ErrInvalidDisplayName},
+		{"the nil id is Register's own rule", uuid.Nil, "ada@example.com", "Ada", ErrInvalidID},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,12 +102,41 @@ func TestRegister_Rejects(t *testing.T) {
 	}
 }
 
-func TestRegister_RejectsOverlongInput(t *testing.T) {
-	long := strings.Repeat("a", 400)
-	if _, err := Register(testID, long+"@example.com", "Ada", testNow); !errors.Is(err, ErrInvalidEmail) {
-		t.Errorf("overlong email: err = %v, want ErrInvalidEmail", err)
+func mustEmail(t *testing.T, raw string) Email {
+	t.Helper()
+	e, err := NewEmail(raw)
+	if err != nil {
+		t.Fatalf("NewEmail(%q): %v", raw, err)
 	}
-	if _, err := Register(testID, "ada@example.com", long, testNow); !errors.Is(err, ErrInvalidDisplayName) {
-		t.Errorf("overlong display name: err = %v, want ErrInvalidDisplayName", err)
+	return e
+}
+
+func mustName(t *testing.T, raw string) DisplayName {
+	t.Helper()
+	n, err := NewDisplayName(raw)
+	if err != nil {
+		t.Fatalf("NewDisplayName(%q): %v", raw, err)
+	}
+	return n
+}
+
+// Register stores the instant it is handed, unchanged. Normalising here would
+// mean the domain silently disagreeing with its caller about what time it is;
+// the Clock port promises UTC, and the layer that owns the clock keeps that
+// promise.
+func TestRegister_KeepsTheTimeItIsGiven(t *testing.T) {
+	zone := time.FixedZone("UTC+7", 7*60*60)
+	at := time.Date(2026, 8, 26, 17, 15, 30, 0, zone)
+
+	u, err := Register(testID, "ada@example.com", "Ada Lovelace", at)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if !u.CreatedAt().Equal(at) {
+		t.Errorf("CreatedAt = %v, want the same instant as %v", u.CreatedAt(), at)
+	}
+	if u.CreatedAt().Location() != zone {
+		t.Errorf("CreatedAt location = %v, want %v — Register must not convert",
+			u.CreatedAt().Location(), zone)
 	}
 }

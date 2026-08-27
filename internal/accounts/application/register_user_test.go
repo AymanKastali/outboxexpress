@@ -47,14 +47,14 @@ func TestRegisterUser_CommitsThenWakesTheRelay(t *testing.T) {
 	if uow.lastMeta.CorrelationID != "corr-1" || uow.lastMeta.Traceparent != "tp-1" {
 		t.Errorf("metadata not passed to the unit of work: %+v", uow.lastMeta)
 	}
-	if len(repo.inserted) != 1 {
-		t.Fatalf("inserted %d users, want 1", len(repo.inserted))
+	if len(repo.saved) != 1 {
+		t.Fatalf("saved %d users, want 1", len(repo.saved))
 	}
-	if repo.inserted[0].Email != "ada@example.com" {
-		t.Errorf("Email = %q", repo.inserted[0].Email)
+	if repo.saved[0].Email().String() != "ada@example.com" {
+		t.Errorf("Email = %q", repo.saved[0].Email())
 	}
-	if !repo.inserted[0].CreatedAt.Equal(ucNow) {
-		t.Errorf("CreatedAt = %v, want the injected clock's time %v", repo.inserted[0].CreatedAt, ucNow)
+	if !repo.saved[0].CreatedAt().Equal(ucNow) {
+		t.Errorf("CreatedAt = %v, want the injected clock's time %v", repo.saved[0].CreatedAt(), ucNow)
 	}
 	if wake.calls != 1 {
 		t.Errorf("wakeup.calls = %d, want 1", wake.calls)
@@ -92,7 +92,7 @@ func TestRegisterUser_SurfacesEmailTaken(t *testing.T) {
 		t.Fatalf("err = %v, want ErrEmailTaken", err)
 	}
 	if uow.committed {
-		t.Error("the transaction must not commit when the insert fails")
+		t.Error("the transaction must not commit when the save fails")
 	}
 	if wake.calls != 0 {
 		t.Error("no event was written, so there is nothing to wake the relay for")

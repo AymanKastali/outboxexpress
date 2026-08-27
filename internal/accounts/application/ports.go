@@ -14,6 +14,11 @@ import (
 
 // Clock and IDGen exist so that a use case is deterministic under test. Reading
 // the wall clock or generating a UUID is I/O against the machine.
+//
+// Now must return UTC. Normalising is this layer's job, not the domain's: an
+// aggregate handed a timestamp stores that instant unchanged, so whatever the
+// clock returns is what gets written and published. A fake clock in a test owes
+// the same guarantee as clock.System.
 type Clock interface {
 	Now() time.Time
 }
@@ -78,16 +83,4 @@ type Envelope struct {
 // infrastructure must not decide what a message means.
 type EnvelopeFactory interface {
 	From(events []domain.Event, meta Metadata) ([]Envelope, error)
-}
-
-// OutboxAppender appends envelopes to the outbox. Unlike UserRepository it is
-// declared here rather than in the domain, because an outbox is not a domain
-// concept — no domain expert has heard of one (spec D5).
-//
-// It is named for the role, not for the table. The relay's needs — claim, mark
-// published, mark failed — are a different role with a different consumer, and
-// Plan 2 declares its own port rather than widening this one into a fat
-// interface with two disjoint users.
-type OutboxAppender interface {
-	Append(ctx context.Context, envelopes []Envelope) error
 }

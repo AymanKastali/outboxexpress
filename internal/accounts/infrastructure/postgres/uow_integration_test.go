@@ -145,7 +145,7 @@ func TestUnitOfWork_NeitherRowSurvivesAFailure(t *testing.T) {
 		pgtest.TruncateAccounts(t, pool)
 		boom := errors.New("boom")
 		err := newUOW(pool).Do(ctx, application.Metadata{}, func(w application.Work) error {
-			if err := w.Users.Insert(ctx, mustRegister(t, "ada@example.com")); err != nil {
+			if err := w.Users.Save(ctx, mustRegister(t, "ada@example.com")); err != nil {
 				return err
 			}
 			return boom
@@ -163,7 +163,7 @@ func TestUnitOfWork_NeitherRowSurvivesAFailure(t *testing.T) {
 		boom := errors.New("no mapping")
 		uow := NewUnitOfWork(pool, failingFactory{err: boom})
 		err := uow.Do(ctx, application.Metadata{}, func(w application.Work) error {
-			return w.Users.Insert(ctx, mustRegister(t, "ada@example.com"))
+			return w.Users.Save(ctx, mustRegister(t, "ada@example.com"))
 		})
 		if !errors.Is(err, boom) {
 			t.Fatalf("err = %v, want the factory error", err)
@@ -178,11 +178,11 @@ func TestUnitOfWork_NeitherRowSurvivesAFailure(t *testing.T) {
 		pgtest.TruncateAccounts(t, pool)
 		boom := errors.New("outbox is unwritable")
 		uow := newUOW(pool)
-		uow.outbox = func(platformpg.Queryer) application.OutboxAppender {
+		uow.outbox = func(platformpg.Queryer) outboxAppender {
 			return failingAppender{err: boom}
 		}
 		err := uow.Do(ctx, application.Metadata{}, func(w application.Work) error {
-			return w.Users.Insert(ctx, mustRegister(t, "ada@example.com"))
+			return w.Users.Save(ctx, mustRegister(t, "ada@example.com"))
 		})
 		if !errors.Is(err, boom) {
 			t.Fatalf("err = %v, want the appender error", err)
@@ -221,10 +221,10 @@ func TestUnitOfWork_TwoAggregatesInOneTransactionProduceTwoRowsInOrder(t *testin
 	second := mustRegister(t, "grace@example.com")
 
 	err := newUOW(pool).Do(ctx, application.Metadata{}, func(w application.Work) error {
-		if err := w.Users.Insert(ctx, first); err != nil {
+		if err := w.Users.Save(ctx, first); err != nil {
 			return err
 		}
-		return w.Users.Insert(ctx, second)
+		return w.Users.Save(ctx, second)
 	})
 	if err != nil {
 		t.Fatalf("Do: %v", err)
@@ -246,9 +246,9 @@ func TestUnitOfWork_TwoAggregatesInOneTransactionProduceTwoRowsInOrder(t *testin
 	if len(order) != 2 {
 		t.Fatalf("len = %d, want 2", len(order))
 	}
-	if order[0] != first.ID.String() || order[1] != second.ID.String() {
+	if order[0] != first.ID().String() || order[1] != second.ID().String() {
 		t.Errorf("order = %v, want [%s %s] — id order is publish order",
-			order, first.ID, second.ID)
+			order, first.ID(), second.ID())
 	}
 }
 
@@ -278,7 +278,7 @@ func TestUnitOfWork_AWriteThatBypassesTheRepositoryEmitsNothing(t *testing.T) {
 	user := mustRegister(t, "ada@example.com")
 
 	if err := uow.Do(ctx, application.Metadata{}, func(w application.Work) error {
-		return w.Users.Insert(ctx, user)
+		return w.Users.Save(ctx, user)
 	}); err != nil {
 		t.Fatalf("first Do: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestUnitOfWork_AWriteThatBypassesTheRepositoryEmitsNothing(t *testing.T) {
 	// A second transaction that changes the row with raw SQL rather than through
 	// the repository. No aggregate is tracked, so no event is collected.
 	if err := uow.Do(ctx, application.Metadata{}, func(w application.Work) error {
-		_, err := pool.Exec(ctx, `UPDATE accounts.users SET display_name = 'Ada L.' WHERE id = $1`, user.ID)
+		_, err := pool.Exec(ctx, `UPDATE accounts.users SET display_name = 'Ada L.' WHERE id = $1`, user.ID())
 		if err != nil {
 			return err
 		}

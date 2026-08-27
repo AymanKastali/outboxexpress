@@ -26,19 +26,15 @@ type unmappedEvent struct{}
 func (unmappedEvent) EventType() string     { return "com.outboxexpress.accounts.user.forgotten" }
 func (unmappedEvent) AggregateType() string { return "User" }
 func (unmappedEvent) AggregateID() string   { return "x" }
-func (unmappedEvent) SchemaVersion() int    { return 1 }
 func (unmappedEvent) OccurredAt() time.Time { return time.Unix(0, 0).UTC() }
 
 func TestCloudEventFactory_ProducesTheExactWireFormat(t *testing.T) {
 	f := NewCloudEventFactory(&seqIDs{})
 
-	event := domain.UserRegistered{
-		UserID:       uuid.MustParse("9f3c1e6a-4b2d-4f8a-9c11-77a2e0d3b5f1"),
-		Email:        "ada@example.com",
-		DisplayName:  "Ada Lovelace",
-		Version:      1,
-		RegisteredAt: time.Date(2026, 8, 26, 10, 15, 30, 100_000_000, time.UTC),
-	}
+	event := registered(t,
+		uuid.MustParse("9f3c1e6a-4b2d-4f8a-9c11-77a2e0d3b5f1"),
+		"ada@example.com", "Ada Lovelace",
+		time.Date(2026, 8, 26, 10, 15, 30, 100_000_000, time.UTC))
 	meta := Metadata{
 		CorrelationID: "corr-7",
 		Traceparent:   "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
@@ -94,13 +90,11 @@ func TestCloudEventFactory_ProducesTheExactWireFormat(t *testing.T) {
 
 func TestCloudEventFactory_OmitsTraceparentWhenAbsent(t *testing.T) {
 	f := NewCloudEventFactory(&seqIDs{})
-	envs, err := f.From([]domain.Event{domain.UserRegistered{
-		UserID:       uuid.MustParse("9f3c1e6a-4b2d-4f8a-9c11-77a2e0d3b5f1"),
-		Email:        "ada@example.com",
-		DisplayName:  "Ada Lovelace",
-		Version:      1,
-		RegisteredAt: time.Date(2026, 8, 26, 10, 15, 30, 0, time.UTC),
-	}}, Metadata{})
+	envs, err := f.From([]domain.Event{registered(t,
+		uuid.MustParse("9f3c1e6a-4b2d-4f8a-9c11-77a2e0d3b5f1"),
+		"ada@example.com", "Ada Lovelace",
+		time.Date(2026, 8, 26, 10, 15, 30, 0, time.UTC),
+	)}, Metadata{})
 	if err != nil {
 		t.Fatalf("From: %v", err)
 	}
@@ -120,8 +114,8 @@ func TestCloudEventFactory_MintsOneIDPerEvent(t *testing.T) {
 	f := NewCloudEventFactory(&seqIDs{})
 	at := time.Date(2026, 8, 26, 10, 15, 30, 0, time.UTC)
 	envs, err := f.From([]domain.Event{
-		domain.UserRegistered{UserID: uuid.New(), Email: "a@b.com", DisplayName: "A", Version: 1, RegisteredAt: at},
-		domain.UserRegistered{UserID: uuid.New(), Email: "c@d.com", DisplayName: "C", Version: 1, RegisteredAt: at},
+		registered(t, uuid.New(), "a@b.com", "A", at),
+		registered(t, uuid.New(), "c@d.com", "C", at),
 	}, Metadata{})
 	if err != nil {
 		t.Fatalf("From: %v", err)
@@ -148,4 +142,25 @@ func TestCloudEventFactory_EmptyInput(t *testing.T) {
 	if len(envs) != 0 {
 		t.Fatalf("len(envs) = %d, want 0", len(envs))
 	}
+}
+
+// registered builds the event the way production does — through the aggregate's
+// constructor — rather than by filling a UserRegistered literal. That keeps the
+// test honest about what the domain actually emits, and it means the value
+// objects' constructors are not re-wrapped in per-package must-helpers.
+func registered(t *testing.T, id uuid.UUID, email, name string, at time.Time) domain.UserRegistered {
+	t.Helper()
+	u, err := domain.Register(id, email, name, at)
+	if err != nil {
+		t.Fatalf("Register(%q, %q): %v", email, name, err)
+	}
+	events := u.PullEvents()
+	if len(events) != 1 {
+		t.Fatalf("Register emitted %d events, want 1", len(events))
+	}
+	event, ok := events[0].(domain.UserRegistered)
+	if !ok {
+		t.Fatalf("Register emitted %T, want domain.UserRegistered", events[0])
+	}
+	return event
 }

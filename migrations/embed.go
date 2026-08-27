@@ -58,10 +58,11 @@ func Parse(name string) (Context, error) {
 // FS returns the migrations of one context, rooted so that goose sees the .sql
 // files at ".".
 func FS(c Context) (fs.FS, error) {
-	if _, err := Parse(string(c)); err != nil {
+	parsed, err := Parse(string(c))
+	if err != nil {
 		return nil, err
 	}
-	return fs.Sub(files, string(c))
+	return fs.Sub(files, string(parsed))
 }
 
 // Latest is the highest migration version embedded for a context. It is derived
@@ -70,8 +71,10 @@ func FS(c Context) (fs.FS, error) {
 //
 // The version is parsed by goose.NumericComponent — the same parser that will
 // run these files — so this package cannot disagree with goose about what a
-// valid migration filename is. fs.Glob returns lexically sorted names, and the
-// prefixes are zero-padded, so the newest is last.
+// valid migration filename is. The prefixes are zero-padded, so lexical order is
+// numeric order and the newest is last. fs.Glob already returns names sorted,
+// and the explicit sort below is kept anyway — it costs nothing on a handful of
+// filenames and it means this function does not depend on that guarantee.
 func Latest(c Context) (int64, error) {
 	f, err := FS(c)
 	if err != nil {

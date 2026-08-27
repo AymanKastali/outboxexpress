@@ -39,7 +39,8 @@ func (r *OutboxRepository) Append(ctx context.Context, envelopes []application.E
 	}
 	batch := &pgx.Batch{}
 	for _, e := range envelopes {
-		batch.Queue(insertOutbox,
+		batch.Queue(
+			insertOutbox,
 			e.EventID,
 			e.AggregateType,
 			e.AggregateID,
@@ -64,4 +65,4 @@ func (r *OutboxRepository) Append(ctx context.Context, envelopes []application.E
 	return nil
 }
 
-var _ application.OutboxAppender = (*OutboxRepository)(nil)
+var _ outboxAppender = (*OutboxRepository)(nil)

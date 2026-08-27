@@ -57,6 +57,25 @@ func TestAccountsSchema(t *testing.T) {
 		}
 	})
 
+	// internal/accounts/infrastructure/postgres/user_repo.go maps a unique
+	// violation to domain.ErrEmailTaken by matching this constraint's NAME. If
+	// the name changes, a duplicate registration stops being a 409 and becomes a
+	// 500, and only a docker-gated test would notice. Assert the name here,
+	// where the schema is the thing under test.
+	t.Run("the email unique constraint is named users_email_key", func(t *testing.T) {
+		var name string
+		err := pool.QueryRow(ctx, `
+			SELECT conname FROM pg_constraint
+			WHERE conrelid = 'accounts.users'::regclass AND contype = 'u'`).Scan(&name)
+		if err != nil {
+			t.Fatalf("query constraint: %v", err)
+		}
+		if name != "users_email_key" {
+			t.Fatalf("constraint name = %q, want users_email_key — user_repo.go "+
+				"matches on this name to return domain.ErrEmailTaken", name)
+		}
+	})
+
 	t.Run("Ready agrees with the embedded latest", func(t *testing.T) {
 		latest, err := migrations.Latest(migrations.Accounts)
 		if err != nil {

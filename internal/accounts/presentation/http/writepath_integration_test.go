@@ -17,6 +17,7 @@ import (
 	accountspg "github.com/AymanKastali/outboxexpress/internal/accounts/infrastructure/postgres"
 	"github.com/AymanKastali/outboxexpress/internal/accounts/infrastructure/wakeup"
 	httpapi "github.com/AymanKastali/outboxexpress/internal/accounts/presentation/http"
+	"github.com/AymanKastali/outboxexpress/internal/platform/admin"
 	"github.com/AymanKastali/outboxexpress/internal/platform/clock"
 	"github.com/AymanKastali/outboxexpress/internal/platform/ids"
 	"github.com/AymanKastali/outboxexpress/internal/platform/pgtest"
@@ -32,10 +33,11 @@ func TestWritePath(t *testing.T) {
 		accountspg.NewUnitOfWork(pool, envelopes),
 		clock.System{},
 		generator,
-		wakeup.NewNotifier(pool, wakeup.ChannelOutboxNew, slog.New(slog.DiscardHandler)),
+		wakeup.NewNotifier(pool, slog.New(slog.DiscardHandler)),
 	)
 	srv := httptest.NewServer(httpapi.NewRouter(
-		httpapi.NewHandler(useCase, generator, slog.New(slog.DiscardHandler))))
+		httpapi.NewHandler(useCase, generator, slog.New(slog.DiscardHandler)),
+		admin.Healthz()))
 	defer srv.Close()
 
 	// The body is read and closed before returning, so the client can reuse one
