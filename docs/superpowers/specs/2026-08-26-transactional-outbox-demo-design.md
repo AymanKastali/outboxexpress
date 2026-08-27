@@ -705,6 +705,19 @@ alternative, marking each row in its own short transaction, would duplicate one 
 and it is why `RELAY_BATCH_SIZE` bounds duplicates per crash and is not only a
 throughput knob.
 
+**A `SIGTERM` is not a crash, and must not be treated as one.** An ordinary
+restart is the most frequent stop a relay has — once per pod, per release — and it
+is the one case where the window above is avoidable. So the relay runs its pass on
+a context that outlives the shutdown signal by `RELAY_DRAIN_GRACE`: the signal
+ends the loop between passes and cuts any sleep short at once, while the pass in
+flight is allowed to finish its produce, make its marks, and commit. This is
+`http.Server.Shutdown`'s rule applied to a loop instead of a listener — stop
+accepting, then let what is in flight finish — and it is the same argument §13.4
+makes for draining the api's listener. Past the grace the pass is cancelled and
+rolls back, which is the undrained behaviour, so the relay logs which of the two
+happened: the operator reading it is mid-deploy, and the two differ in whether
+duplicates were left behind.
+
 ### 11.3 Consumption — the consuming transaction
 
 ```go
@@ -998,9 +1011,29 @@ sender logs each gateway outcome and the `occurred_at`-to-send latency, the
 number a product owner feels. Consumer lag is read with
 `kafka-consumer-groups.sh`, which `make lag` wraps.
 
-The backlog fields come from one stats query per pass, issued on the transaction
-that is already open, so observation costs a single cheap round trip rather than
-a background collector holding its own connection. Every number in those lines
+The backlog fields come from one stats query per pass, issued on the relay's pool
+**after the pass has committed** — not on the claiming transaction — and a failure
+to read them is recorded on the pass line rather than returned.
+
+That is a correction to an earlier version of this section, which put the query on
+the transaction already open to save a round trip. It cannot go there. PostgreSQL
+aborts a transaction on any statement error, so there is no such thing as a
+tolerable failure inside one: a `statement_timeout` on this query would leave the
+commit that marks a durably-acked batch returning `ErrTxCommitRollback`, and every
+message in that batch would be published again because a count of rows could not
+be read. And this is the query that gets slow — counting the backlog costs the
+backlog — so it would trip first during exactly the outage the design exists to
+survive. §13.1 draws the line for the wakeup: "an optimisation, never the delivery
+path." Observation is the same rule's other half, and a pool-bound port is what
+makes it structural rather than a comment.
+
+What that sentence was really protecting is still protected: one extra round trip
+on the same pool is not a background collector and does not hold a connection.
+Reading after the commit also makes the numbers honest — read inside, they
+described a backlog that excluded rows the pass had marked, in a pass that might
+still roll back. The pass line therefore prints either the four numbers or
+`stats_error`, because a zero backlog and an unreadable backlog look identical on
+a dashboard and only one of them is good news. Every number in those lines
 comes out of a use case's result struct (§6.1) — none is a counter incremented in
 the middle of business logic — which is exactly why each one is assertable in a
 unit test.
@@ -1063,6 +1096,7 @@ startup, refusing to start on an invalid value. No configuration library.
 | `RELAY_BACKOFF_BASE` / `RELAY_BACKOFF_CAP` | `1s` / `5m` | relay, sender |
 | `RELAY_MAX_ATTEMPTS` | `10` | relay, sender — an alert threshold, not a transition |
 | `RELAY_USE_NOTIFY` | `true` | relay |
+| `RELAY_DRAIN_GRACE` | `15s` | relay, sender — how long a pass in flight may finish after `SIGTERM` (§11.2); must fit inside the orchestrator's own termination grace |
 | `CONSUMER_MAX_DELIVERIES` | `5` | notifier |
 | `CONSUMER_RETRY_ATTEMPTS` | `3` | notifier |
 | `EMAIL_GATEWAY_URL` | — | sender |

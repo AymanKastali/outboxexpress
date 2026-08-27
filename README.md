@@ -57,13 +57,32 @@ observability — there is no `/metrics` endpoint and no metrics library, by des
 
 ```json
 {"level":"INFO","msg":"relay pass","claimed":1,"published":1,
- "transient_failures":0,"permanent_failures":0,"backlog":0,
- "oldest_pending_age_ms":0,"failed_rows":0,"stuck_rows":0,
- "batch_ms":12,"notify_queue_usage":0}
+ "transient_failures":0,"permanent_failures":0,"batch_ms":12,
+ "backlog":0,"oldest_pending_age_ms":0,"failed_rows":0,"stuck_rows":0,
+ "notify_queue_usage":0}
 ```
 
 `oldest_pending_age_ms` is the one to watch. §13.3 calls it "the best single
 signal — a stuck relay shows here first."
+
+The four backlog fields are read on the pool after the pass commits, so they can
+fail without taking the pass with them. When they do, the line carries
+`stats_error` instead of the four numbers — a zero backlog and an unreadable
+backlog look the same on a dashboard, and only one of them is good news.
+
+Two lines are worth recognising because they are the only ones that mean
+duplicates were created:
+
+```json
+{"level":"ERROR","msg":"relay pass rolled back; every row it claimed is still pending",
+ "claimed":40,"republish_on_retry":12,"batch_ms":3104}
+{"level":"WARN","msg":"relay stopped, but the drain grace expired with a pass still in flight; ..."}
+```
+
+`republish_on_retry` is how many messages the broker durably has whose marks were
+undone. Everything else about a rolled-back pass is safe — the rows are still
+pending and nothing is lost — but those will arrive twice, which is why the
+consumer's inbox is not optional.
 
 Then read the event off the topic:
 
@@ -121,6 +140,18 @@ is a stated guarantee here, the relay runs single active with a hot standby
 |---|---|
 | Shard relays by `hash(aggregate_id)` | Real parallelism, but each relay needs a stable shard assignment and a rebalance protocol — a coordination problem the outbox does not otherwise have. |
 | Accept version-stamped events with last-writer-wins consumers | Full parallelism, and consumers must carry `version` and discard stale events. §9's pragmatic alternative; it moves the guarantee to the consuming end. |
+
+**A window you can close.** Between the broker's ack and the mark, a *crash*
+leaves the message published and the row pending, and the next pass publishes it
+again. That cannot be closed: closing it would need an atomic commit across Kafka
+and PostgreSQL, which is the problem the outbox exists to avoid.
+
+A restart is a different matter, and this demo does close that one. `SIGTERM` ends
+the pass loop between passes but leaves the pass in flight running for
+`RELAY_DRAIN_GRACE`, so it finishes its produce, marks its rows and commits —
+`http.Server.Shutdown`'s rule, applied to a loop. Without it every rolling deploy
+republished whatever the current batch had already acked, once per pod. Try it:
+`make run-relay`, register a few users, and Ctrl-C mid-pass.
 
 **A wakeup you can rely on.** `NOTIFY` is an optimisation and never the delivery
 path (§13.1). Notifications are not durable and are not delivered to a listener
