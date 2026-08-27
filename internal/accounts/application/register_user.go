@@ -18,6 +18,16 @@ type RegisterUserResult struct {
 	UserID uuid.UUID
 }
 
+// Wakeup shortens the relay's polling latency. It has no error return by
+// design: this is an optimisation and never the delivery path, so there is no
+// failure a caller could sensibly handle (spec §11.1 rule 3, §13.1).
+//
+// Declared here because this use case is its only caller — the one place in the
+// producing path where a commit has happened and a relay could usefully be told.
+type Wakeup interface {
+	Notify(ctx context.Context)
+}
+
 // RegisterUser is the whole producing use case. Read it and notice what is
 // missing: there is no outbox here. That is the point of spec §5 — the invariant
 // "every state change emits its event" is structural, enforced by the unit of

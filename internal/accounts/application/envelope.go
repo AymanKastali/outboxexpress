@@ -3,6 +3,9 @@ package application
 import (
 	"errors"
 	"fmt"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/AymanKastali/outboxexpress/internal/accounts/domain"
 	"github.com/AymanKastali/outboxexpress/internal/platform/messaging"
@@ -18,6 +21,26 @@ const (
 )
 
 var ErrUnmappedEvent = errors.New("application: no message mapping for event type")
+
+// Envelope is one outbox row's worth of content: the routing columns the relay
+// reads, and the already-serialised message it must not read.
+type Envelope struct {
+	EventID       uuid.UUID
+	AggregateType string
+	AggregateID   string
+	EventType     string
+	SchemaVersion int
+	Payload       []byte
+	Headers       map[string]string
+	OccurredAt    time.Time
+}
+
+// EnvelopeFactory maps domain events onto the message contract. This is an
+// application concern: the domain must not know what CloudEvents is, and the
+// infrastructure must not decide what a message means.
+type EnvelopeFactory interface {
+	From(events []domain.Event, meta Metadata) ([]Envelope, error)
+}
 
 // CloudEventFactory maps this context's domain events onto the message contract.
 //
