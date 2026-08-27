@@ -1914,8 +1914,16 @@ Expected: PASS, including every subtest of `TestRegister_Rejects`.
 
 - [ ] **Step 8: Verify the domain imports nothing it should not**
 
+A package is external exactly when the first element of its import path
+contains a dot — the same rule Task 14's architecture test uses. `vendor/...`
+and `crypto/internal/...` paths are the standard library's own vendored trees,
+which `net/mail` pulls in, so they are excluded by name rather than by the dot
+test:
+
 ```bash
-go list -deps ./internal/accounts/domain | grep -v '^internal/' | grep -v '^[a-z]*$' | grep -v '^\(bufio\|bytes\|context\|crypto\|encoding\|errors\|fmt\|hash\|internal\|io\|math\|net\|os\|reflect\|runtime\|slices\|sort\|strconv\|strings\|sync\|time\|unicode\|unique\|iter\|cmp\|maps\|log\|path\|vendor\)'
+go list -deps ./internal/accounts/domain \
+  | awk -F/ '$1 ~ /\./ && $1 != "vendor"' \
+  | grep -v '^github.com/AymanKastali/outboxexpress/'
 ```
 
 Expected: exactly one line, `github.com/google/uuid`. Anything else is a dependency-rule violation to fix now rather than in Task 14.
