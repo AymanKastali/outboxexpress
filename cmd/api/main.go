@@ -82,20 +82,18 @@ func run() error {
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	adminSrv := &http.Server{
-		Addr: cfg.AdminAddr,
-		Handler: admin.Router(func(ctx context.Context) error {
-			return migrations.Ready(ctx, pool, expectedSchema)
-		}),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	// One definition of the admin listener and its shutdown rule, in the package
+	// that owns the operator surface. cmd/relay runs the identical thing.
+	adminSrv := admin.NewServer(cfg.AdminAddr, func(ctx context.Context) error {
+		return migrations.Ready(ctx, pool, expectedSchema)
+	})
 
 	log.Info("api starting",
 		"http", cfg.HTTPAddr, "admin", cfg.AdminAddr, "expected_schema", expectedSchema)
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return listen(public, "public") })
-	g.Go(func() error { return listen(adminSrv, "admin") })
+	g.Go(func() error { return admin.Listen(adminSrv) })
 	g.Go(func() error {
 		<-gctx.Done()
 		log.Info("api shutting down")

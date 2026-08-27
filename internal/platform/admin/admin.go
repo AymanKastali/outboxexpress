@@ -7,9 +7,16 @@ package admin
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 )
+
+// serverReadHeaderTimeout bounds how long a client may take over its headers.
+// The admin listener binds loopback (§13.5) and answers two trivial routes, so
+// this is about a stuck connection holding a goroutine, not about an attacker.
+const serverReadHeaderTimeout = 5 * time.Second
 
 // readyTimeout bounds the readiness check. A probe that can hang is a probe that
 // makes an orchestrator's timeout the real behaviour.
@@ -55,4 +62,28 @@ func Router(ready func(context.Context) error) *http.ServeMux {
 	})
 
 	return mux
+}
+
+// NewServer builds the admin listener every process in this project runs: /healthz
+// from Healthz, /readyz from ready.
+//
+// It is here rather than in each main because the shutdown rule is the same in all
+// of them and there will be four of them. A timeout that only two processes out of
+// four apply is a timeout nobody can reason about.
+func NewServer(addr string, ready func(context.Context) error) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           Router(ready),
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+	}
+}
+
+// Listen serves until the server is shut down, treating a clean shutdown as
+// success. ErrServerClosed is what Shutdown produces, and a process that reported
+// it as a failure would exit non-zero on every ordinary stop.
+func Listen(srv *http.Server) error {
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("admin listener: %w", err)
+	}
+	return nil
 }

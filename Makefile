@@ -5,7 +5,7 @@ export GOTOOLCHAIN := auto
 
 COMPOSE := docker compose -f deploy/docker-compose.yml
 
-.PHONY: build test test-integration lint fmt up db-up db-down db-logs kafka-up topics migrate run-api
+.PHONY: build test test-integration lint fmt up db-up db-down db-logs kafka-up topics migrate run-api run-relay
 
 up: db-up kafka-up topics
 
@@ -48,6 +48,11 @@ db-logs:
 
 migrate:
 > go run ./cmd/migrate -context all -action up
+
+# ADMIN_ADDR is set here because .env.example holds the api's value and both
+# processes read the same variable (spec §14).
+run-relay:
+> ADMIN_ADDR=127.0.0.1:8082 go run ./cmd/relay
 
 run-api:
 > go run ./cmd/api
