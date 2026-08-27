@@ -31,3 +31,6 @@ db-down:
 
 db-logs:
 > $(COMPOSE) logs -f postgres
+
+migrate:
+> go run ./cmd/migrate -context all -action up

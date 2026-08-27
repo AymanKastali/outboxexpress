@@ -707,6 +707,7 @@ git commit -m "feat(platform): injectable clock, UUIDv7 identifiers and JSON log
 ## Task 4: Schema, the migrate command, and a throwaway database for tests
 
 **Files:**
+- Create: `internal/platform/postgres/queryer.go`
 - Create: `migrations/embed.go`
 - Create: `migrations/accounts/0001_init.sql`
 - Create: `migrations/notifications/0001_init.sql`
@@ -715,6 +716,11 @@ git commit -m "feat(platform): injectable clock, UUIDv7 identifiers and JSON log
 - Test: `migrations/migrations_test.go` (unit, no container)
 - Test: `migrations/schema_integration_test.go` (`//go:build integration`)
 - Modify: `Makefile` (add the `migrate` target)
+
+`platform/postgres` is split across two tasks because `migrations.Ready` takes a
+`Queryer` and therefore cannot wait for Task 8. `queryer.go` — the interface and
+the package doc — is written here; `pool.go`, with `NewPool` and `WithTx`, is
+written in Task 8, which is where the first caller of either appears.
 
 **Interfaces:**
 - Consumes: `config.LoadMigrate`, `logging.New` (Tasks 2, 3).
@@ -1082,7 +1088,7 @@ func Ready(ctx context.Context, q platformpg.Queryer, expected int64) error {
 - [ ] **Step 7: Run the unit test to verify it passes**
 
 Run: `go test ./migrations/ -v`
-Expected: PASS for all three tests.
+Expected: PASS for all four tests.
 
 - [ ] **Step 8: Write the migrate command**
 
@@ -1519,7 +1525,7 @@ Expected: `{"level":"INFO","msg":"migrated","context":"accounts","version":1}` t
 - [ ] **Step 14: Commit**
 
 ```bash
-git add go.mod go.sum migrations cmd/migrate internal/platform/pgtest Makefile
+git add go.mod go.sum migrations cmd/migrate internal/platform/pgtest internal/platform/postgres Makefile
 git commit -m "feat(migrations): accounts and notifications schema, migrate command, test harness"
 ```
 
